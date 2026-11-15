@@ -1331,41 +1331,45 @@ html_content = r'''<!DOCTYPE html>
     .attr-movers-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      margin-bottom: 16px;
+      gap: 12px;
+      margin-bottom: 14px;
     }
     .attr-movers-card {
       background: var(--bg-card);
       border: 1px solid var(--border-subtle);
       border-radius: 12px;
-      padding: 14px;
+      padding: 11px 12px;
       min-width: 0;
     }
     .attr-movers-card-title {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      font-size: 0.86rem;
+      font-size: 0.85rem;
       font-weight: 700;
-      margin-bottom: 10px;
-      padding-bottom: 7px;
+      margin-bottom: 8px;
+      padding-bottom: 6px;
       border-bottom: 1px solid var(--border-subtle);
     }
     .attr-movers-list {
       display: flex;
       flex-direction: column;
-      gap: 9px;
+      gap: 5px;
       min-width: 0;
     }
     .attr-mover-row {
       display: flex;
       flex-direction: column;
-      gap: 4px;
-      padding: 6px 8px;
-      border-radius: 8px;
+      gap: 2px;
+      padding: 5px 8px;
+      border-radius: 7px;
       background: var(--bg-surface);
-      border: 1px solid rgba(148, 163, 184, 0.12);
+      border: 1px solid rgba(148, 163, 184, 0.14);
       min-width: 0;
+    }
+    html.light .attr-mover-row {
+      background: var(--bg-base);
+      border-color: var(--border-subtle);
     }
     .attr-mover-row.ref-fallback {
       opacity: 0.84;
@@ -1375,29 +1379,33 @@ html_content = r'''<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      gap: 8px;
+      gap: 6px;
       min-width: 0;
     }
     .attr-mover-left {
       display: flex;
       align-items: center;
-      gap: 6px;
+      gap: 4px 5px;
       min-width: 0;
       flex: 1;
       flex-wrap: wrap;
     }
     .attr-mover-rank {
-      width: 18px;
-      height: 18px;
+      width: 17px;
+      height: 17px;
       border-radius: 5px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      font-size: 0.68rem;
+      font-size: 0.67rem;
       font-weight: 700;
       background: var(--bg-card);
       color: var(--text-muted);
       flex-shrink: 0;
+    }
+    html.light .attr-mover-rank {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
     }
     .attr-mover-name {
       font-size: 0.80rem;
@@ -1409,12 +1417,13 @@ html_content = r'''<!DOCTYPE html>
       max-width: 190px;
     }
     .attr-acct-badge {
-      font-size: 0.66rem;
+      font-size: 0.65rem;
       font-weight: 600;
       color: var(--text-secondary);
       background: rgba(148, 163, 184, 0.12);
       border: 1px solid rgba(148, 163, 184, 0.22);
-      padding: 1px 5px;
+      padding: 0 5px;
+      line-height: 1.45;
       border-radius: 4px;
       white-space: nowrap;
       max-width: 140px;
@@ -1422,12 +1431,13 @@ html_content = r'''<!DOCTYPE html>
       text-overflow: ellipsis;
     }
     .attr-trade-badge {
-      font-size: 0.66rem;
+      font-size: 0.65rem;
       font-weight: 700;
       color: #fbbf24;
       background: rgba(245, 158, 11, 0.16);
       border: 1px solid rgba(251, 191, 36, 0.36);
-      padding: 1px 6px;
+      padding: 0 5px;
+      line-height: 1.45;
       border-radius: 999px;
       white-space: nowrap;
     }
@@ -1441,14 +1451,18 @@ html_content = r'''<!DOCTYPE html>
       flex-shrink: 0;
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
+      line-height: 1.25;
     }
     .attr-mover-delta {
-      font-size: 0.82rem;
+      font-size: 0.80rem;
       font-weight: 700;
+      line-height: 1.25;
     }
     .attr-mover-meta {
-      font-size: 0.69rem;
+      font-size: 0.68rem;
       color: var(--text-muted);
+      line-height: 1.25;
+      margin-top: 1px;
     }
     .attr-bar-track {
       width: 100%;
@@ -1465,11 +1479,12 @@ html_content = r'''<!DOCTYPE html>
     .attr-bar-fill.neg { background: linear-gradient(90deg, #e11d48, #fb7185); }
     .attr-bar-fill.pos { background: linear-gradient(90deg, #059669, #34d399); }
     .attr-mover-sub {
-      font-size: 0.69rem;
+      font-size: 0.68rem;
+      line-height: 1.3;
       color: var(--text-muted);
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 2px 6px;
       align-items: center;
     }
     .attr-factors-wrap {
@@ -2106,10 +2121,15 @@ html_content = r'''<!DOCTYPE html>
       .attr-period-pills { display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 4px !important; width: 100%; }
       .attr-period-pill { padding: 5px 4px !important; font-size: 0.68rem !important; text-align: center; }
       .attr-auto-summary { padding: 10px 10px !important; font-size: 0.77rem !important; }
-      .attr-movers-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
-      .attr-movers-card { padding: 10px 8px !important; }
+      .attr-movers-grid { grid-template-columns: 1fr !important; gap: 8px !important; margin-bottom: 12px !important; }
+      .attr-movers-card { padding: 9px 8px !important; }
+      .attr-movers-card-title { margin-bottom: 6px !important; padding-bottom: 5px !important; }
+      .attr-movers-list { gap: 4px !important; }
+      .attr-mover-row { padding: 4px 7px !important; gap: 2px !important; }
       .attr-mover-name { max-width: 140px !important; font-size: 0.74rem !important; }
       .attr-mover-delta { font-size: 0.75rem !important; }
+      .attr-mover-meta { font-size: 0.64rem !important; }
+      .attr-mover-sub { font-size: 0.64rem !important; gap: 2px 5px !important; }
       .attr-factors-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
       .assets-table-controls { width: 100%; justify-content: flex-start; }
       .assets-table-period-tabs { width: 100%; gap: 4px; }
@@ -3258,7 +3278,6 @@ html_content = r'''<!DOCTYPE html>
         return;
       }
 
-      const maxAbs = Math.max(...list.map(x => Math.abs(Number(x.delta_krw || 0))), 1);
       const headerBanner = isRefFallback
         ? `<div style="font-size:0.71rem; color:var(--text-muted); margin-bottom:2px;">⏸️ 당일 휴장(변동 0원) — 참고: 직전 거래일(<strong>${escapeAttrHtml(fallbackInfo.date)}</strong>) 변동</div>`
         : "";
@@ -3266,8 +3285,6 @@ html_content = r'''<!DOCTYPE html>
       const rowsHtml = list.map((item, idx) => {
         const dKrw = Number(item.delta_krw || 0);
         const dPct = Number(item.delta_pct || 0);
-        const barW = Math.min(100, Math.max(4, (Math.abs(dKrw) / maxAbs) * 100)).toFixed(1);
-        const barCls = dKrw < 0 ? "neg" : "pos";
         const valCls = dKrw < 0 ? "pnl-minus" : (dKrw > 0 ? "pnl-plus" : "");
         const allKnownAssets = (typeof activeAssets !== "undefined" && Array.isArray(activeAssets) && activeAssets.length > 0)
           ? activeAssets
@@ -3321,7 +3338,6 @@ html_content = r'''<!DOCTYPE html>
                 <div class="attr-mover-meta">${metaParts.join(" · ")}</div>
               </div>
             </div>
-            <div class="attr-bar-track"><div class="attr-bar-fill ${barCls}" style="width:${barW}%;"></div></div>
             ${subParts.length > 0 ? `<div class="attr-mover-sub">${subParts.join("")}</div>` : ""}
           </div>
         `;

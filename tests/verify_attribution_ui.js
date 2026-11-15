@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /**
- * Phase 23.1 (v1.1 / T-28-7) 급등/급락 원인 분석 & RP 리뷰 제외 UI/DOM/브라우저 전수 QA 검증
+ * Phase 23.1 (v1.1 / T-28-7 + T-28-9) 급등/급락 원인 분석 & RP 리뷰 제외 + 슬림 Top 5 Movers UI/DOM/브라우저 전수 QA 검증
  *
  * 검증 항목:
  * 1. web/index.html <script> 블록 추출 및 node --check (구문 오류 0건) + v1.1 문구/레거시 0건
  * 2. DEFAULT_ATTRIBUTION_CACHE.schema_version === "1.1" 및 실보유 61/62종·AST-037·RP 제외 무결성
- * 3. Node VM + Mock DOM 시뮬레이션 (isRpTrade, renderTradesTable, 실보유 배지, 9기간·4시나리오·7테이블탭)
+ * 3. Node VM + Mock DOM 시뮬레이션 (isRpTrade, renderTradesTable, 실보유 배지, 슬림 Top 5 바 0건/팩터 바 6건, 9기간·4시나리오·7테이블탭)
  * 4. 격리 로컬 HTTP 서버(127.0.0.1:0, 운영 포트 8765 무간섭) + 실제 Headless Chrome CDP E2E:
  *    - #tradesTable 리뷰 RP 제외: #tradesCountBadge === "1건", KODEX 반도체레버리지만 노출, RP 0건
  *    - #attributionPanel 실보유 UI: 1W(61종, #attrTradeNotice 숨김) vs 1M(62종, #attrTradeNotice 비-RP 노출, 단위문구)
+ *      & 슬림 Top 5 Movers(#attrDraggersList/#attrLeadersList .attr-bar-track 0건, #attrFactorsGrid .attr-bar-track 6건 유지)
  *      & peak_drawdown AST-037 .attr-trade-badge("11/06 56주 전량매도 반영")·기관/계좌 배지("나무증권 · 평생우대 [CMA]")
  *    - 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀) -> #hoverMoversRow 검증
  *    - 기능 3: #assetsTablePeriodTabs 7개 탭 전환 및 profit_krw / return_rate 정렬 단조성 검증
@@ -386,15 +387,20 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
 
     const factorCards = (ensureEl("attrFactorsGrid").innerHTML.match(/class="attr-factor-card\b/g) || []).length;
     assert.strictEqual(factorCards, 6, `VM expected 6 factor cards on ${p}`);
+    const factorBarTracks = (ensureEl("attrFactorsGrid").innerHTML.match(/class="attr-bar-track"/g) || []).length;
+    assert.strictEqual(factorBarTracks, 6, `VM expected 6 factor bar tracks on ${p}`);
+    assert(!ensureEl("attrDraggersList").innerHTML.includes("attr-bar-track"), `VM #attrDraggersList should not have .attr-bar-track on ${p}`);
+    assert(!ensureEl("attrLeadersList").innerHTML.includes("attr-bar-track"), `VM #attrLeadersList should not have .attr-bar-track on ${p}`);
   }
 
-  // 1-b) AST-037 매매 배지 & 기관/계좌 배지 직접 렌더링 검증
+  // 1-b) AST-037 매매 배지 & 기관/계좌 배지 직접 렌더링 검증 (슬림 row: 바 트랙 0건)
   const ast37Peak = diskAttr.scenarios.all.periods.peak_drawdown.by_asset["AST-037"];
   const tmpCol = makeMockElement("tmpAttrCol");
   ctx.renderAttrMoversColumn(tmpCol, [ast37Peak], "dragger", null);
   assert(tmpCol.innerHTML.includes('class="attr-trade-badge"'), "VM missing .attr-trade-badge for AST-037");
   assert(tmpCol.innerHTML.includes("11/06 56주 전량매도 반영"), "VM missing AST-037 trade_event_note");
   assert(tmpCol.innerHTML.includes("나무증권 · 평생우대 [CMA]"), "VM missing AST-037 institution/account badge");
+  assert(!tmpCol.innerHTML.includes("attr-bar-track"), "VM AST-037 slim row should not include .attr-bar-track");
 
   // 2) 접기/펼치기 & 4대 시나리오 토글
   ctx.toggleAttributionCollapse();
@@ -630,6 +636,19 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       })()`);
     }, 12000, "initial render + /api/attribution & /api/transactions sync");
 
+    // 초기 렌더링 직후 슬림 Top 5 Movers 바 0건 & 6대 팩터 바 6건 단언
+    const initBarCounts = await cdp.eval(`(() => ({
+      dRows: document.querySelectorAll('#attrDraggersList .attr-mover-row').length,
+      lRows: document.querySelectorAll('#attrLeadersList .attr-mover-row').length,
+      dBars: document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length,
+      lBars: document.querySelectorAll('#attrLeadersList .attr-mover-row .attr-bar-track').length,
+      fBars: document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length
+    }))()`);
+    assert(initBarCounts.dRows > 0 && initBarCounts.lRows > 0, `Initial render expected non-empty mover rows, got ${JSON.stringify(initBarCounts)}`);
+    assert.strictEqual(initBarCounts.dBars, 0, `Initial #attrDraggersList .attr-mover-row .attr-bar-track count != 0: ${initBarCounts.dBars}`);
+    assert.strictEqual(initBarCounts.lBars, 0, `Initial #attrLeadersList .attr-mover-row .attr-bar-track count != 0: ${initBarCounts.lBars}`);
+    assert.strictEqual(initBarCounts.fBars, 6, `Initial #attrFactorsGrid .attr-factor-card .attr-bar-track count != 6: ${initBarCounts.fBars}`);
+
     // ------------------------------------------------------------------------
     // 기능 4: #tradesTable 리뷰 RP 제외 검증
     // ------------------------------------------------------------------------
@@ -670,9 +689,12 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
         const dCount = document.querySelectorAll('#attrDraggersList .attr-mover-row').length;
         const lCount = document.querySelectorAll('#attrLeadersList .attr-mover-row').length;
         const fCount = document.querySelectorAll('#attrFactorsGrid .attr-factor-card').length;
+        const dBarCount = document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length;
+        const lBarCount = document.querySelectorAll('#attrLeadersList .attr-mover-row .attr-bar-track').length;
+        const fBarCount = document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length;
         const activePills = Array.from(document.querySelectorAll('#attrPeriodPills .attr-period-pill.active')).map(e => e.getAttribute('data-period'));
         const activeChips = Array.from(document.querySelectorAll('#periodReturnsStrip .period-chip.attr-active')).map(e => e.getAttribute('data-period'));
-        return { meta, summary, tradeText, tradeDisp, draggersUnit, leadersUnit, dCount, lCount, fCount, activePills, activeChips };
+        return { meta, summary, tradeText, tradeDisp, draggersUnit, leadersUnit, dCount, lCount, fCount, dBarCount, lBarCount, fBarCount, activePills, activeChips };
       })()`);
       assert(!res.error, res.error);
       assert(res.meta.includes("연금포함 전체"), `Browser 1280px ${p} headerMeta missing scenario: ${res.meta}`);
@@ -685,6 +707,12 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       assert(res.activeChips.length === 2 && res.activeChips.every(x => x === p), `Browser active chips mismatch on ${p}`);
       assert.strictEqual(res.fCount, 6, `Browser ${p} factor card count != 6`);
       assert(res.dCount <= 5 && res.lCount <= 5, `Browser ${p} draggers/leaders > 5`);
+      if (p === "1M") {
+        assert(res.dCount >= 1 && res.lCount >= 1, `Browser ${p} expected non-empty mover rows, got d=${res.dCount}, l=${res.lCount}`);
+      }
+      assert.strictEqual(res.dBarCount, 0, `Browser ${p} #attrDraggersList .attr-mover-row .attr-bar-track count != 0`);
+      assert.strictEqual(res.lBarCount, 0, `Browser ${p} #attrLeadersList .attr-mover-row .attr-bar-track count != 0`);
+      assert.strictEqual(res.fBarCount, 6, `Browser ${p} #attrFactorsGrid .attr-factor-card .attr-bar-track count != 6`);
 
       if (p !== "1D") {
         assert.strictEqual(res.draggersUnit, "거래내역 반영 실보유 기준", `Browser ${p} #attrDraggersUnit mismatch: ${res.draggersUnit}`);
@@ -715,6 +743,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
         badgeText: badge ? badge.innerText : '',
         acctText: acct ? acct.innerText : '',
         badgeVisible: !!(badgeRect && badgeRect.width > 0 && badgeRect.height > 0),
+        barTrackCount: listEl.querySelectorAll('.attr-mover-row .attr-bar-track').length,
         html: listEl.innerHTML
       };
       renderAttributionPanel(); // 정상 패널 상태로 즉시 복원
@@ -725,6 +754,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     assert.strictEqual(ast37Render.badgeText, "11/06 56주 전량매도 반영");
     assert.strictEqual(ast37Render.acctText, "나무증권 · 평생우대 [CMA]");
     assert(ast37Render.badgeVisible, "AST-037 .attr-trade-badge not visible in Chrome DOM");
+    assert.strictEqual(ast37Render.barTrackCount, 0, "AST-037 slim row should have 0 .attr-bar-track");
 
     // 접기 / 펼치기 실제 클릭 검증
     const collapseState = await cdp.eval(`(() => {
@@ -763,7 +793,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       assert(meta.includes(EXPECTED_SCENARIO_LABELS[sc]), `Browser toggle sync failed (${pen},${risk}): ${meta}`);
       assert(meta.includes(`실보유 ${expN}종`), `Browser toggle sync expected 실보유 ${expN}종: ${meta}`);
     }
-    console.log("  -> PASS [기능 1]: 1W(61종/공지숨김) vs 1M(62종/비-RP공지/단위문구), AST-037 배지·계좌, 4대 토글 확인");
+    console.log("  -> PASS [기능 1]: 1W(61종/공지숨김) vs 1M(62종/비-RP공지/단위문구), 슬림 Top 5 바 0건 & 팩터 바 6건, AST-037 배지·계좌, 4대 토글 확인");
 
     // ------------------------------------------------------------------------
     // 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀)
@@ -950,11 +980,20 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
         innerW: window.innerWidth,
         panelRight: panel.right,
         bannerRight: banner.right,
-        tabsRight: tabs.right
+        tabsRight: tabs.right,
+        dRows: document.querySelectorAll('#attrDraggersList .attr-mover-row').length,
+        lRows: document.querySelectorAll('#attrLeadersList .attr-mover-row').length,
+        dBars: document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length,
+        lBars: document.querySelectorAll('#attrLeadersList .attr-mover-row .attr-bar-track').length,
+        fBars: document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length
       };
     })()`);
     assert(mobileMetrics.scrollW <= mobileMetrics.innerW, `Mobile 375px horizontal overflow: ${mobileMetrics.scrollW} > ${mobileMetrics.innerW}`);
     assert(mobileMetrics.panelRight <= 376 && mobileMetrics.bannerRight <= 376 && mobileMetrics.tabsRight <= 376);
+    assert(mobileMetrics.dRows > 0 && mobileMetrics.lRows > 0, `Mobile 375px expected non-empty mover rows, got ${JSON.stringify(mobileMetrics)}`);
+    assert.strictEqual(mobileMetrics.dBars, 0, `Mobile 375px #attrDraggersList .attr-mover-row .attr-bar-track count != 0`);
+    assert.strictEqual(mobileMetrics.lBars, 0, `Mobile 375px #attrLeadersList .attr-mover-row .attr-bar-track count != 0`);
+    assert.strictEqual(mobileMetrics.fBars, 6, `Mobile 375px #attrFactorsGrid .attr-factor-card .attr-bar-track count != 6`);
 
     const exceptions = cdp.events.filter(e => e.method === "Runtime.exceptionThrown");
     const consoleErrors = cdp.events.filter(
