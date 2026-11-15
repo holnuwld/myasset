@@ -14,6 +14,8 @@
 | **T-28-7** | **v5.3.1 회귀·신규 시나리오 QA 검증 및 GitHub 푸시** | `qa-verifier` | ✅ 완료 | `tests/test_attribution_qa.py`(8/8 PASS) & `tests/verify_attribution_ui.js`(ALL PASS, Chrome 375px/1280px·CDP·8766 E2E 무오류, RP 3대 채널 0건) `APPROVED`, 메인 `c:\cowork\myasset`(`v5.2-stable`) 및 8765 운영 서버 무손상 확인 |
 | **T-28-8** | **Top 5 Movers 가로 바 그래프 제거 및 슬림 레이아웃 개선** | `developer` | ✅ 완료 | `renderAttrMoversColumn()` 내 `.attr-bar-track` 제거(6대 팩터 바 유지), `.attr-mover-row` 패딩·간격 슬림화 및 `web/index.html`(2,048,200B) 재컴파일 완료 |
 | **T-28-9** | **슬림 UI 회귀 검증(`tests/verify_attribution_ui.js`) 및 GitHub 푸시** | `qa-verifier` | ✅ 완료 | `tests/verify_attribution_ui.js`(ALL PASS, Top 5 바 0건 & 팩터 바 6건, Chrome 375px/1280px E2E) 및 `tests/test_attribution_qa.py`(8/8 PASS) 통과, `c:\cowork\myasset` 무손상 확인 및 `feat/attribution` 푸시 |
+| **T-28-10** | **Top 5 금액 칸 비례 음영 그래프(`.attr-delta-shade`) 적용** | `developer` | ✅ 완료 | `.attr-mover-right` 기준 폭 통일(`184px` / 모바일 `142px`), `.attr-mover-delta` 전역 배경 제거 및 우측 정렬 금액 크기(`|delta_krw| / maxAbs`) 비례 음영(`.attr-delta-shade`) 구현, `web/index.html`(2,050,047B) 재컴파일 |
+| **T-28-11** | **금액 음영 비례·단조성 QA 검증(`tests/verify_attribution_ui.js`) 및 GitHub 푸시** | `qa-verifier` | ✅ 완료 | `tests/verify_attribution_ui.js`(42리스트/210행 184px·142px 통일·단조감소·공식·우측축 정렬 PASS) 및 `tests/test_attribution_qa.py`(8/8 PASS) 통과, `c:\cowork\myasset` 무손상 확인 및 `feat/attribution` 푸시 |
 
 ---
 

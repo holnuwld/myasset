@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 /**
- * Phase 23.1 (v1.1 / T-28-7 + T-28-9) 급등/급락 원인 분석 & RP 리뷰 제외 + 슬림 Top 5 Movers UI/DOM/브라우저 전수 QA 검증
+ * Phase 23.1 (v1.1 / T-28-7 + T-28-9 + T-28-11) 급등/급락 원인 분석 & RP 리뷰 제외 + 슬림 Top 5 Movers & 비례 음영 UI/DOM/브라우저 전수 QA 검증
  *
  * 검증 항목:
  * 1. web/index.html <script> 블록 추출 및 node --check (구문 오류 0건) + v1.1 문구/레거시 0건
  * 2. DEFAULT_ATTRIBUTION_CACHE.schema_version === "1.1" 및 실보유 61/62종·AST-037·RP 제외 무결성
- * 3. Node VM + Mock DOM 시뮬레이션 (isRpTrade, renderTradesTable, 실보유 배지, 슬림 Top 5 바 0건/팩터 바 6건, 9기간·4시나리오·7테이블탭)
+ * 3. Node VM + Mock DOM 시뮬레이션 (isRpTrade, renderTradesTable, 실보유 배지, 슬림 Top 5 바 0건/비례 음영/팩터 바 6건, 9기간·4시나리오·7테이블탭)
  * 4. 격리 로컬 HTTP 서버(127.0.0.1:0, 운영 포트 8765 무간섭) + 실제 Headless Chrome CDP E2E:
  *    - #tradesTable 리뷰 RP 제외: #tradesCountBadge === "1건", KODEX 반도체레버리지만 노출, RP 0건
  *    - #attributionPanel 실보유 UI: 1W(61종, #attrTradeNotice 숨김) vs 1M(62종, #attrTradeNotice 비-RP 노출, 단위문구)
  *      & 슬림 Top 5 Movers(#attrDraggersList/#attrLeadersList .attr-bar-track 0건, #attrFactorsGrid .attr-bar-track 6건 유지)
+ *      & Top 5 금액 칸 비례 음영(.attr-delta-shade): 184px/모바일 142px 통일, 투명 배경(rgba(0,0,0,0)), 단조 감소, 100%·max(4, |delta|/maxAbs*100) 공식, 우측 축 정렬
  *      & peak_drawdown AST-037 .attr-trade-badge("11/06 56주 전량매도 반영")·기관/계좌 배지("나무증권 · 평생우대 [CMA]")
  *    - 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀) -> #hoverMoversRow 검증
  *    - 기능 3: #assetsTablePeriodTabs 7개 탭 전환 및 profit_krw / return_rate 정렬 단조성 검증
@@ -32,6 +33,7 @@ const TX_JSON_PATH = path.join(REPO_ROOT, "data", "transactions.json");
 const EXPECTED_PERIODS_9 = [
   "1Y", "YTD", "6M", "3M", "1M", "1W", "1D", "peak_drawdown", "trough_gain"
 ];
+const TRADING_PERIODS = ["1W", "1M", "3M", "6M", "YTD", "1Y", "peak_drawdown", "trough_gain"];
 const POST_SELL_PERIODS = new Set(["1D", "1W"]);
 const PRE_SELL_SPAN_PERIODS = new Set(["1M", "3M", "6M", "YTD", "1Y", "peak_drawdown", "trough_gain"]);
 
@@ -124,6 +126,9 @@ function verifySyntaxAndEmbeddedData() {
     'id="tradesTableBody"',
     'id="tradesCountBadge"',
     ".attribution-panel",
+    ".attr-mover-delta",
+    ".attr-delta-shade",
+    ".attr-delta-val",
     ".attr-trade-badge",
     ".hover-movers-row",
     ".assets-table-period-tabs"
@@ -391,6 +396,10 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
     assert.strictEqual(factorBarTracks, 6, `VM expected 6 factor bar tracks on ${p}`);
     assert(!ensureEl("attrDraggersList").innerHTML.includes("attr-bar-track"), `VM #attrDraggersList should not have .attr-bar-track on ${p}`);
     assert(!ensureEl("attrLeadersList").innerHTML.includes("attr-bar-track"), `VM #attrLeadersList should not have .attr-bar-track on ${p}`);
+    assert(ensureEl("attrDraggersList").innerHTML.includes('class="attr-delta-shade neg"'), `VM #attrDraggersList missing .attr-delta-shade.neg on ${p}`);
+    assert(ensureEl("attrLeadersList").innerHTML.includes('class="attr-delta-shade pos"'), `VM #attrLeadersList missing .attr-delta-shade.pos on ${p}`);
+    assert(ensureEl("attrDraggersList").innerHTML.includes("width:100.0%;"), `VM #attrDraggersList row1 missing width:100.0% on ${p}`);
+    assert(ensureEl("attrLeadersList").innerHTML.includes("width:100.0%;"), `VM #attrLeadersList row1 missing width:100.0% on ${p}`);
   }
 
   // 1-b) AST-037 매매 배지 & 기관/계좌 배지 직접 렌더링 검증 (슬림 row: 바 트랙 0건)
@@ -597,6 +606,168 @@ async function waitUntil(fn, timeoutMs = 10000, label = "condition") {
   throw new Error(`Timed out waiting for: ${label}`);
 }
 
+async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, viewportLabel }) {
+  let checkedLists = 0;
+  let checkedRows = 0;
+  for (const p of periods) {
+    const report = await cdp.eval(`(() => {
+      const chip = document.querySelector('#periodReturnsStrip .period-chip[data-period="${p}"]');
+      if (!chip) return { error: 'Missing chip for ${p}' };
+      chip.click();
+      const scKey = getActiveAttributionScenarioKey();
+      const scObj = getAttributionScenarioData(scKey);
+      const pData = scObj && scObj.periods ? scObj.periods['${p}'] : null;
+      if (!pData) return { error: 'Missing period data for ${p}' };
+
+      let expectedLists = {
+        '#attrDraggersList': Array.isArray(pData.top_draggers) ? pData.top_draggers : [],
+        '#attrLeadersList': Array.isArray(pData.top_leaders) ? pData.top_leaders : []
+      };
+      if (pData.is_market_closed_day && expectedLists['#attrDraggersList'].length === 0 && expectedLists['#attrLeadersList'].length === 0 && pData.fallback_trading_date) {
+        const fb = getDailyMover(pData.fallback_trading_date, scKey);
+        if (fb) {
+          expectedLists['#attrDraggersList'] = Array.isArray(fb.top_draggers) ? fb.top_draggers : [];
+          expectedLists['#attrLeadersList'] = Array.isArray(fb.top_leaders) ? fb.top_leaders : [];
+        }
+      }
+
+      const cols = ['#attrDraggersList', '#attrLeadersList'].map(sel => {
+        const rows = Array.from(document.querySelectorAll(sel + ' .attr-mover-row'));
+        const srcList = expectedLists[sel] || [];
+        return {
+          sel,
+          rowCount: rows.length,
+          expectedCount: srcList.length,
+          rows: rows.map((row, idx) => {
+            const deltaEl = row.querySelector('.attr-mover-delta');
+            const shadeEl = deltaEl ? deltaEl.querySelector('.attr-delta-shade') : null;
+            const valEl = deltaEl ? deltaEl.querySelector('.attr-delta-val') : null;
+            const deltaRect = deltaEl ? deltaEl.getBoundingClientRect() : null;
+            const shadeRect = shadeEl ? shadeEl.getBoundingClientRect() : null;
+            const valText = valEl ? valEl.innerText.trim() : (deltaEl ? deltaEl.innerText.trim() : '');
+            const digits = valText.replace(/[^\\d]/g, '');
+            const domAbsDelta = digits ? Number(digits) : 0;
+            const dataDeltaKrw = srcList[idx] ? Number(srcList[idx].delta_krw || 0) : null;
+            return {
+              idx,
+              valText,
+              domAbsDelta,
+              dataAbsDelta: dataDeltaKrw === null ? null : Math.abs(dataDeltaKrw),
+              deltaBg: deltaEl ? getComputedStyle(deltaEl).backgroundColor : '',
+              shadeBg: shadeEl ? getComputedStyle(shadeEl).backgroundColor : '',
+              inlineWidth: shadeEl ? shadeEl.style.width : '',
+              stylePct: shadeEl ? parseFloat(shadeEl.style.width) : NaN,
+              deltaWidth: deltaRect ? deltaRect.width : NaN,
+              deltaRight: deltaRect ? deltaRect.right : NaN,
+              shadeWidth: shadeRect ? shadeRect.width : NaN,
+              shadeRight: shadeRect ? shadeRect.right : NaN
+            };
+          })
+        };
+      });
+      return { scKey, cols };
+    })()`);
+
+    assert(!report.error, `${viewportLabel}/${p}: ${report.error}`);
+    for (const col of report.cols) {
+      checkedLists += 1;
+      const ctxLabel = `${viewportLabel}/${report.scKey}/${p}/${col.sel}`;
+      assert.strictEqual(col.rowCount, 5, `${ctxLabel} expected 5 mover rows, got ${col.rowCount}`);
+      assert.strictEqual(col.rowCount, col.expectedCount, `${ctxLabel} DOM rowCount != data list length`);
+
+      const absDeltas = col.rows.map(r => r.dataAbsDelta);
+      const maxAbs = Math.max(...absDeltas, 1);
+      const baseRight = col.rows[0].deltaRight;
+
+      for (let i = 0; i < col.rows.length; i++) {
+        checkedRows += 1;
+        const r = col.rows[i];
+        const rowLabel = `${ctxLabel}[row${i + 1}]`;
+
+        // 1) .attr-mover-delta 실측 width 5개 행 모두 오차 없이 동일함 (184px / 모바일 142px)
+        assert(
+          Math.abs(r.deltaWidth - expectedWidthPx) <= 0.01,
+          `${rowLabel} .attr-mover-delta width=${r.deltaWidth} != expected ${expectedWidthPx}px`
+        );
+        assert(
+          Math.abs(r.deltaWidth - col.rows[0].deltaWidth) <= 0.01,
+          `${rowLabel} .attr-mover-delta width=${r.deltaWidth} != row1 width=${col.rows[0].deltaWidth}`
+        );
+
+        // 2) .attr-mover-delta 계산 배경 투명(rgba(0, 0, 0, 0)) & .attr-delta-shade 배경 가시성 확인
+        assert.strictEqual(
+          r.deltaBg,
+          "rgba(0, 0, 0, 0)",
+          `${rowLabel} .attr-mover-delta backgroundColor must be rgba(0, 0, 0, 0), got ${r.deltaBg}`
+        );
+        assert(
+          r.shadeBg && r.shadeBg !== "rgba(0, 0, 0, 0)" && r.shadeBg !== "transparent",
+          `${rowLabel} .attr-delta-shade must have non-transparent backgroundColor, got ${r.shadeBg}`
+        );
+
+        // 3) DOM 금액과 데이터 금액 일치 & row1=100%, 나머지 max(4, (|delta_krw| / maxAbs) * 100) 공식 일치 (±0.2% / ±1px 이내)
+        assert.strictEqual(
+          r.domAbsDelta,
+          r.dataAbsDelta,
+          `${rowLabel} DOM abs delta ${r.domAbsDelta} != data abs delta ${r.dataAbsDelta} (${r.valText})`
+        );
+        assert(
+          typeof r.inlineWidth === "string" && r.inlineWidth.endsWith("%") && Number.isFinite(r.stylePct),
+          `${rowLabel} .attr-delta-shade inline style.width must end with '%', got "${r.inlineWidth}"`
+        );
+
+        const formulaPct = r.dataAbsDelta > 0
+          ? Math.min(100, Math.max(4, (r.dataAbsDelta / maxAbs) * 100))
+          : 0;
+        if (i === 0) {
+          assert(
+            r.stylePct === 100 && (r.inlineWidth === "100%" || r.inlineWidth === "100.0%"),
+            `${rowLabel} inline style width must be 100%, got "${r.inlineWidth}"`
+          );
+          assert(
+            Math.abs(r.shadeWidth - expectedWidthPx) <= 1.0,
+            `${rowLabel} shade px width=${r.shadeWidth} expected ${expectedWidthPx}px (±1px)`
+          );
+        } else {
+          assert(
+            Math.abs(r.stylePct - formulaPct) <= 0.2,
+            `${rowLabel} stylePct=${r.stylePct}% deviates >0.2% from formula=${formulaPct.toFixed(3)}%`
+          );
+          const expectedPx = (formulaPct / 100) * r.deltaWidth;
+          assert(
+            Math.abs(r.shadeWidth - expectedPx) <= 1.0,
+            `${rowLabel} shadeWidth=${r.shadeWidth}px deviates >1px from expected=${expectedPx.toFixed(2)}px`
+          );
+        }
+
+        // 4) shade.right === delta.right 우측 축 수직 정렬 확인 (및 5개 행 동일 우측 축 정렬)
+        assert(
+          Math.abs(r.shadeRight - r.deltaRight) <= 0.05,
+          `${rowLabel} shade.right (${r.shadeRight}) != delta.right (${r.deltaRight})`
+        );
+        assert(
+          Math.abs(r.deltaRight - baseRight) <= 0.05,
+          `${rowLabel} delta.right (${r.deltaRight}) misaligned with row1 delta.right (${baseRight})`
+        );
+
+        // 5) 단조 감소 검증 (row1 >= row2 >= row3 >= row4 >= row5)
+        if (i > 0) {
+          const prev = col.rows[i - 1];
+          assert(
+            prev.stylePct >= r.stylePct,
+            `${rowLabel} stylePct not monotonically decreasing: row${i}=${prev.stylePct}% < row${i + 1}=${r.stylePct}%`
+          );
+          assert(
+            prev.shadeWidth >= r.shadeWidth,
+            `${rowLabel} shadeWidth not monotonically decreasing: row${i}=${prev.shadeWidth}px < row${i + 1}=${r.shadeWidth}px`
+          );
+        }
+      }
+    }
+  }
+  return { checkedLists, checkedRows };
+}
+
 async function verifyRealBrowserE2E(html, diskAttr, txJson) {
   console.log("[STEP 4] 실제 Headless Chrome CDP 브라우저 E2E 검증 (격리 HTTP 서버, 8765 무관)...");
   const browserExe = findBrowserExe();
@@ -794,6 +965,26 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       assert(meta.includes(`실보유 ${expN}종`), `Browser toggle sync expected 실보유 ${expN}종: ${meta}`);
     }
     console.log("  -> PASS [기능 1]: 1W(61종/공지숨김) vs 1M(62종/비-RP공지/단위문구), 슬림 Top 5 바 0건 & 팩터 바 6건, AST-037 배지·계좌, 4대 토글 확인");
+
+    // ------------------------------------------------------------------------
+    // 기능 1-b (T-28-11): 1280px 데스크톱 Top 5 금액 칸 비례 음영(.attr-delta-shade) 검증
+    // ------------------------------------------------------------------------
+    const desktopShadeRes = await verifyDeltaShadeMonotonicity(cdp, {
+      periods: [...TRADING_PERIODS, "1D"],
+      expectedWidthPx: 184,
+      viewportLabel: "Desktop-1280px-dark"
+    });
+    // 라이트 모드에서도 .attr-mover-delta 투명 배경 및 비례 음영 무결성 확인 후 원복
+    await cdp.eval(`document.documentElement.classList.add('light');`);
+    const lightShadeRes = await verifyDeltaShadeMonotonicity(cdp, {
+      periods: ["1W", "1M", "peak_drawdown"],
+      expectedWidthPx: 184,
+      viewportLabel: "Desktop-1280px-light"
+    });
+    await cdp.eval(`document.documentElement.classList.remove('light');`);
+    console.log(
+      `  -> PASS [T-28-11 데스크톱 음영]: 1280px 다크(${desktopShadeRes.checkedLists}리스트/${desktopShadeRes.checkedRows}행)·라이트(${lightShadeRes.checkedLists}리스트/${lightShadeRes.checkedRows}행) 폭 184px 통일·투명배경·단조감소·공식·우측축 정렬 확인`
+    );
 
     // ------------------------------------------------------------------------
     // 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀)
@@ -994,6 +1185,16 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     assert.strictEqual(mobileMetrics.dBars, 0, `Mobile 375px #attrDraggersList .attr-mover-row .attr-bar-track count != 0`);
     assert.strictEqual(mobileMetrics.lBars, 0, `Mobile 375px #attrLeadersList .attr-mover-row .attr-bar-track count != 0`);
     assert.strictEqual(mobileMetrics.fBars, 6, `Mobile 375px #attrFactorsGrid .attr-factor-card .attr-bar-track count != 6`);
+
+    // 375px 모바일 Top 5 금액 칸 비례 음영(.attr-delta-shade) 검증 (142px 통일·투명배경·단조감소·공식·우측축 정렬)
+    const mobileShadeRes = await verifyDeltaShadeMonotonicity(cdp, {
+      periods: [...TRADING_PERIODS, "1D"],
+      expectedWidthPx: 142,
+      viewportLabel: "Mobile-375px"
+    });
+    console.log(
+      `  -> PASS [T-28-11 모바일 음영]: 375px (${mobileShadeRes.checkedLists}리스트/${mobileShadeRes.checkedRows}행) 폭 142px 통일·투명배경·단조감소·공식·우측축 정렬 확인`
+    );
 
     const exceptions = cdp.events.filter(e => e.method === "Runtime.exceptionThrown");
     const consoleErrors = cdp.events.filter(
