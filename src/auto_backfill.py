@@ -49,8 +49,91 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "asset_history.json")
 ASSETS_FILE = os.path.join(DATA_DIR, "assets_v3.json")
+TRANSACTIONS_FILE = os.path.join(DATA_DIR, "transactions.json")
 CALCULATED_CACHE_FILE = os.path.join(DATA_DIR, "calculated_history_cache.json")
 TICKER_HISTORY_CACHE_FILE = os.path.join(DATA_DIR, "ticker_history_cache.json")
+
+_RP_NAME_RE = re.compile(r"(일반|외화|수시|약정|원화)\s*RP|\bRP\b", re.IGNORECASE)
+
+
+def _is_rp_trade(tx):
+    """RP(환매조건부채권) 거래 판별 SSoT 규칙 (명세 §2.5)"""
+    if not tx or not isinstance(tx, dict):
+        return False
+    ticker = str(tx.get("ticker") or "").strip().upper()
+    channel = str(tx.get("channel") or "").strip()
+    name = str(tx.get("asset_name") or tx.get("name") or "").strip()
+    asset_type = str(tx.get("asset_type") or "").strip().upper()
+    if ticker.startswith("RP-"):
+        return True
+    if channel == "구글시트_RP거래내역":
+        return True
+    if any(kw in name for kw in ("일반RP", "외화RP", "수시RP", "약정RP", "원화RP")):
+        return True
+    if _RP_NAME_RE.search(name):
+        return True
+    if asset_type in ("RP", "외화RP", "원화RP"):
+        return True
+    return False
+
+
+def load_transactions(tx_file=None):
+    path = tx_file or TRANSACTIONS_FILE
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _collect_non_rp_sold_assets(assets, transactions):
+    """
+    transactions.json 내 APPLIED 비-RP 시장성 매매 이력이 있는 전량 매도/청산 자산 목록 반환 (명세 §2.1/§2.2)
+    """
+    active_ids = {
+        a.get("id")
+        for a in (assets or [])
+        if a.get("id") and (float(a.get("quantity") or 0) > 0 or float(a.get("valuation_krw") or 0) > 0)
+    }
+    assets_by_id = {a.get("id"): a for a in (assets or []) if a.get("id")}
+    sold_assets = []
+    seen_ids = set()
+    for tx in (transactions or []):
+        if tx.get("status") != "APPLIED":
+            continue
+        if _is_rp_trade(tx):
+            continue
+        if tx.get("trade_type") not in ("BUY", "SELL"):
+            continue
+        aid = tx.get("asset_id")
+        tkr = (tx.get("ticker") or "").strip()
+        key = aid or tkr
+        if not key or key in active_ids or key in seen_ids:
+            continue
+        a = assets_by_id.get(aid) if aid else None
+        if a is None:
+            curr = tx.get("currency") or "KRW"
+            a = {
+                "id": aid or f"TX-SOLD-{tkr}",
+                "name": tx.get("asset_name") or tkr or "청산종목",
+                "ticker": tkr,
+                "category": tx.get("category") or ("해외주식" if curr in ("USD", "JPY") else "국내주식"),
+                "institution": tx.get("institution") or "",
+                "account_name": tx.get("account_name") or "",
+                "currency": curr,
+                "quantity": 0.0,
+                "valuation_krw": 0,
+                "current_price": float(tx.get("price") or 0),
+                "tags": [],
+            }
+        a_tkr = (a.get("ticker") or "").strip()
+        if not a_tkr or a_tkr.startswith(("DEP-", "CASH-", "RP-")):
+            continue
+        seen_ids.add(key)
+        sold_assets.append(a)
+    return sold_assets
 
 DOMESTIC_TICKERS = [
     "396500", "390390", "487230", "381170", "329750", "0048J0", "160580", "379810",
@@ -300,9 +383,18 @@ def _fill_date_series(raw_map, date_list):
     return filled
 
 
-def save_ticker_history_cache(price_history, assets=None, cache_file=None, min_date=None, max_date=None, live_market_data=None):
+def save_ticker_history_cache(
+    price_history,
+    assets=None,
+    cache_file=None,
+    min_date=None,
+    max_date=None,
+    live_market_data=None,
+    transactions=None,
+):
     """
     수집된 일별 종가·FX 데이터를 data/ticker_history_cache.json (명세 §4.2)으로 원자적 저장.
+    활성 자산뿐 아니라 비-RP transactions.json 매도/매수 이력 종목 티커(494310 등)도 함께 보존한다.
     수집 실패 티커는 기존 캐시 데이터를 보존하고, 달력 전 일자 ffill/bfill을 전개한다.
     """
     path = cache_file or TICKER_HISTORY_CACHE_FILE
@@ -310,6 +402,8 @@ def save_ticker_history_cache(price_history, assets=None, cache_file=None, min_d
 
     if assets is None:
         assets = load_assets()
+    if transactions is None:
+        transactions = load_transactions()
 
     existing_tcache = load_ticker_history_cache(path)
     existing_calc = load_calculated_cache()
@@ -337,10 +431,13 @@ def save_ticker_history_cache(price_history, assets=None, cache_file=None, min_d
         a for a in (assets or [])
         if float(a.get("quantity") or 0) > 0 or float(a.get("valuation_krw") or 0) > 0
     ]
+    sold_assets = _collect_non_rp_sold_assets(assets, transactions)
+    eval_assets = active_assets + sold_assets
+
     market_assets = []
     fixed_assets = []
     ticker_currency_map = {}
-    for a in active_assets:
+    for a in eval_assets:
         t = (a.get("ticker") or "").strip()
         if not t or t.startswith(("DEP-", "CASH-", "RP-")):
             fixed_assets.append(a)
@@ -349,12 +446,13 @@ def save_ticker_history_cache(price_history, assets=None, cache_file=None, min_d
             ticker_currency_map[t] = a.get("currency", "KRW")
 
     unique_market_tickers = sorted(ticker_currency_map.keys())
-    all_target_tickers = sorted(set(unique_market_tickers) | set(price_history.keys()) - {"KRW=X", "JPYKRW=X"})
+    all_target_tickers = sorted(set(unique_market_tickers) | (set((price_history or {}).keys()) - {"KRW=X", "JPYKRW=X"}))
 
     is_weekend = (end_dt.weekday() >= 5)
     live_prices = (live_market_data or {}).get("prices", {}) if isinstance(live_market_data, dict) else {}
     live_fx = (live_market_data or {}).get("fx", {}) if isinstance(live_market_data, dict) else {}
 
+    price_history = price_history or {}
     # FX 엔트리 구축
     fx_section = {}
     existing_fx = existing_tcache.get("fx", {})
@@ -465,6 +563,8 @@ def save_ticker_history_cache(price_history, assets=None, cache_file=None, min_d
         "tickers": tickers_section,
         "coverage": {
             "total_active_assets": len(active_assets),
+            "tracked_sold_assets": len(sold_assets),
+            "total_eval_assets": len(eval_assets),
             "market_traded_assets": len(market_assets),
             "fixed_price_assets": len(fixed_assets),
             "unique_market_tickers": len(unique_market_tickers),
@@ -738,14 +838,34 @@ def run_auto_backfill():
             "completed_at": datetime.now(KST).isoformat()
         }
 
-    # 1. 일봉 종가 병렬 크롤링
-    print(f"[AutoBackfill] 일봉 데이터 병렬 수집 시작 (국내 {len(DOMESTIC_TICKERS)}종, 해외 {len(FOREIGN_TICKERS)}종, 환율 2종, KRX금 1종)...")
-    price_history = collect_daily_prices(DOMESTIC_TICKERS, FOREIGN_TICKERS, FX_TICKERS)
+    # 1. 일봉 종가 병렬 크롤링 (활성 + 비-RP 매도/매수 이력 티커 누락 방지)
+    transactions = load_transactions()
+    sold_eval_assets = _collect_non_rp_sold_assets(assets, transactions)
+    dom_list = list(DOMESTIC_TICKERS)
+    for_list = list(FOREIGN_TICKERS)
+    dom_set = set(dom_list)
+    for_set = set(for_list)
+    for a in assets + sold_eval_assets:
+        t = (a.get("ticker") or "").strip()
+        if not t or t.startswith(("DEP-", "CASH-", "RP-")) or t == "GOLD-KRX":
+            continue
+        curr = a.get("currency", "KRW")
+        if curr == "KRW" and not t.endswith(".T"):
+            if t not in dom_set:
+                dom_set.add(t)
+                dom_list.append(t)
+        else:
+            if t not in for_set:
+                for_set.add(t)
+                for_list.append(t)
+
+    print(f"[AutoBackfill] 일봉 데이터 병렬 수집 시작 (국내 {len(dom_list)}종, 해외 {len(for_list)}종, 환율 2종, KRX금 1종)...")
+    price_history = collect_daily_prices(dom_list, for_list, FX_TICKERS)
     print(f"[AutoBackfill] 수집 완료 ({len(price_history)}개 종목 데이터 확보)")
 
     # 1.5 종목별 일별 종가 캐시 영구 저장 (data/ticker_history_cache.json)
     try:
-        save_ticker_history_cache(price_history, assets)
+        save_ticker_history_cache(price_history, assets, transactions=transactions)
     except Exception as e:
         print(f"[AutoBackfill] ticker_history_cache 저장 경고: {e}")
 

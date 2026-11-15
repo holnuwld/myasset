@@ -1,7 +1,17 @@
 # 자산 관리 프로그램 작업 보드 (`task_board.md`)
 
 > **관리자**: 비서 (Main Orchestrator)  
-> **문서 버전**: v5.3 완료 (Phase 23: 계좌 총액 급등/급락 원인 자산 기여도 분석 및 워크트리 격리 구현)  
+> **문서 버전**: v5.3.1 완료 (Phase 23.1: 거래내역 반영 실보유 기준 기여도 산출 및 매매내역 리뷰 RP 제외)  
+
+---
+
+## Phase 23.1 (v5.3.1): 거래내역 기반 실보유 기준 Best 5/Worst 5 및 매매내역 리뷰 RP 제외
+
+| ID | 단계 및 작업 항목 | 담당 에이전트 | 상태 | 세부 내용 및 산출물 |
+| :-: | :--- | :---: | :---: | :--- |
+| **T-28-5** | **실보유 수량 역산($Q_i(d)$) 및 매매내역 리뷰 RP 제외 명세(`docs/attribution_analysis_spec.md` v1.1) 개정** | `architect` | ✅ 완료 | `data/transactions.json` 기반 기간 내 신규매수·전량/부분매도 실보유 손익 공식, FIFO/Shapley 가격·환율 분해, `daily_movers` 망원합 일치, UI 문구 `"거래내역 반영 실보유 기준"` 및 `is_rp_trade()` RP 제외 규칙 설계 (`docs/attribution_analysis_spec.md` v1.1, 1,114줄) |
+| **T-28-6** | **백엔드(`src/attribution_engine.py`, `src/live_price_server.py`) 및 웹 대시보드(`build_web_index.py` -> `web/index.html`) v5.3.1 반영** | `developer` | ✅ 완료 | 거래이력 실보유 기준 Best 5/Worst 5 계산(`AST-037` 11/6 매도 반영 `1M`/`peak_drawdown` 포함·`1D`/`1W` 제외), FIFO Shapley/망원합 0원 오차, RP 거래 리뷰 제외(`is_rp_trade`), `"거래내역 반영 실보유 기준"` 라벨 및 매매 배지 표시, `attribution_cache.json`(v1.1) 및 `web/index.html`(2,039,722B) 재컴파일 완료 |
+| **T-28-7** | **v5.3.1 회귀·신규 시나리오 QA 검증 및 GitHub 푸시** | `qa-verifier` | ✅ 완료 | `tests/test_attribution_qa.py`(8/8 PASS) & `tests/verify_attribution_ui.js`(ALL PASS, Chrome 375px/1280px·CDP·8766 E2E 무오류, RP 3대 채널 0건) `APPROVED`, 메인 `c:\cowork\myasset`(`v5.2-stable`) 및 8765 운영 서버 무손상 확인 |
 
 ---
 

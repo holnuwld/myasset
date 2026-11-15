@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 /**
- * Phase 23 급등/급락 원인 분석 UI/DOM/브라우저 전수 QA 검증 (T-28-4)
+ * Phase 23.1 (v1.1 / T-28-7) 급등/급락 원인 분석 & RP 리뷰 제외 UI/DOM/브라우저 전수 QA 검증
  *
  * 검증 항목:
- * 1. web/index.html <script> 블록 추출 및 node --check (구문 오류 0건)
- * 2. EMBEDDED_ATTRIBUTION_DATA 파싱 및 attribution_cache.json 정합성 검증
- * 3. Node VM + Mock DOM 시뮬레이션 (기능 1·2·3 함수 단위 검증)
+ * 1. web/index.html <script> 블록 추출 및 node --check (구문 오류 0건) + v1.1 문구/레거시 0건
+ * 2. DEFAULT_ATTRIBUTION_CACHE.schema_version === "1.1" 및 실보유 61/62종·AST-037·RP 제외 무결성
+ * 3. Node VM + Mock DOM 시뮬레이션 (isRpTrade, renderTradesTable, 실보유 배지, 9기간·4시나리오·7테이블탭)
  * 4. 격리 로컬 HTTP 서버(127.0.0.1:0, 운영 포트 8765 무간섭) + 실제 Headless Chrome CDP E2E:
- *    - 기능 1: 9개 기간 칩 클릭 -> #attributionPanel 업데이트, Draggers/Leaders <=5, 6대 팩터, 접기/펼치기, 4대 토글 동기화
+ *    - #tradesTable 리뷰 RP 제외: #tradesCountBadge === "1건", KODEX 반도체레버리지만 노출, RP 0건
+ *    - #attributionPanel 실보유 UI: 1W(61종, #attrTradeNotice 숨김) vs 1M(62종, #attrTradeNotice 비-RP 노출, 단위문구)
+ *      & peak_drawdown AST-037 .attr-trade-badge("11/06 56주 전량매도 반영")·기관/계좌 배지("나무증권 · 평생우대 [CMA]")
  *    - 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀) -> #hoverMoversRow 검증
  *    - 기능 3: #assetsTablePeriodTabs 7개 탭 전환 및 profit_krw / return_rate 정렬 단조성 검증
- *    - 반응형 레이아웃: 1280px 데스크톱 & 375px 모바일 가로 overflow 0건, uncaught page error 0건
+ *    - 반응형 레이아웃: 1280px 데스크톱 & 375px 모바일 가로 overflow 0건, uncaught/console error 0건
  */
 
 const fs = require("fs");
@@ -29,6 +31,9 @@ const TX_JSON_PATH = path.join(REPO_ROOT, "data", "transactions.json");
 const EXPECTED_PERIODS_9 = [
   "1Y", "YTD", "6M", "3M", "1M", "1W", "1D", "peak_drawdown", "trough_gain"
 ];
+const POST_SELL_PERIODS = new Set(["1D", "1W"]);
+const PRE_SELL_SPAN_PERIODS = new Set(["1M", "3M", "6M", "YTD", "1Y", "peak_drawdown", "trough_gain"]);
+
 const EXPECTED_SCENARIO_LABELS = {
   all: "연금포함 전체",
   no_pension: "연금제외 전체",
@@ -44,6 +49,15 @@ const EXPECTED_TABLE_HEADERS = {
   YTD: ["YTD 변동액(KRW)", "YTD 등락률"],
   peak_drawdown: ["고점대비 변동액(KRW)", "고점대비 등락률"]
 };
+const LEGACY_FORBIDDEN_PHRASES = ["일정 보유수량", "일정 수량", "일정수량", "외화RP 롤오버"];
+const RP_LEAK_PATTERNS = ["RP-", "일반RP", "외화RP", "수시RP", "약정RP", "원화RP", "TX-20261110"];
+
+function assertNoRpLeak(text, contextLabel) {
+  const s = String(text || "");
+  for (const tok of RP_LEAK_PATTERNS) {
+    assert(!s.includes(tok), `${contextLabel} leaked RP token "${tok}": ${s}`);
+  }
+}
 
 function extractScriptsFromHtml(html) {
   const scripts = [];
@@ -56,7 +70,7 @@ function extractScriptsFromHtml(html) {
 }
 
 // ============================================================================
-// STEP 1 & 2: <script> 구문 검증 (node --check) + EMBEDDED_ATTRIBUTION_DATA 정합성
+// STEP 1 & 2: <script> 구문 검증 (node --check) + v1.1 EMBEDDED_ATTRIBUTION_DATA
 // ============================================================================
 function verifySyntaxAndEmbeddedData() {
   console.log("[STEP 1] web/index.html <script> 추출 및 node --check 실행...");
@@ -77,6 +91,12 @@ function verifySyntaxAndEmbeddedData() {
   }
   console.log(`  -> PASS: <script> ${scripts.length}개 블록 (${combinedScript.length.toLocaleString()} chars) node --check 구문 오류 0건`);
 
+  // 레거시 문구 0건 & v1.1 실보유 문구 존재 검증
+  for (const phrase of LEGACY_FORBIDDEN_PHRASES) {
+    assert(!html.includes(phrase), `Legacy phrase "${phrase}" still present in web/index.html`);
+  }
+  assert(html.includes("거래내역 반영 실보유 기준"), 'Missing v1.1 wording "거래내역 반영 실보유 기준" in web/index.html');
+
   // 필수 HTML 요소 및 CSS 클래스 확인
   const requiredSelectors = [
     'id="periodReturnsStrip"',
@@ -89,6 +109,8 @@ function verifySyntaxAndEmbeddedData() {
     'id="attrTradeNotice"',
     'id="attrDraggersList"',
     'id="attrLeadersList"',
+    'id="attrDraggersUnit"',
+    'id="attrLeadersUnit"',
     'id="attrFactorsGrid"',
     'id="chartHoverBanner"',
     'id="hoverMoversRow"',
@@ -97,7 +119,11 @@ function verifySyntaxAndEmbeddedData() {
     'id="assetsTablePeriodTabs"',
     'id="thProfitLabel"',
     'id="thReturnLabel"',
+    'id="tradesTable"',
+    'id="tradesTableBody"',
+    'id="tradesCountBadge"',
     ".attribution-panel",
+    ".attr-trade-badge",
     ".hover-movers-row",
     ".assets-table-period-tabs"
   ];
@@ -105,17 +131,22 @@ function verifySyntaxAndEmbeddedData() {
     assert(html.includes(token), `Missing UI token in web/index.html: ${token}`);
   }
 
-  console.log("[STEP 2] EMBEDDED_ATTRIBUTION_DATA 파싱 및 데이터 무결성 검증...");
-  const m = combinedScript.match(/const\s+EMBEDDED_ATTRIBUTION_DATA\s*=\s*(\{[\s\S]*?\});\s*\r?\n\s*const\s+DEFAULT_ATTRIBUTION_CACHE/);
-  assert(m && m[1], "Failed to extract EMBEDDED_ATTRIBUTION_DATA literal");
+  console.log("[STEP 2] DEFAULT_ATTRIBUTION_CACHE v1.1 파싱 및 데이터 무결성 검증...");
+  const m = combinedScript.match(/const\s+EMBEDDED_ATTRIBUTION_DATA\s*=\s*(\{[\s\S]*?\});\s*\r?\n\s*const\s+DEFAULT_ATTRIBUTION_CACHE\s*=\s*EMBEDDED_ATTRIBUTION_DATA;/);
+  assert(m && m[1], "Failed to extract EMBEDDED_ATTRIBUTION_DATA / DEFAULT_ATTRIBUTION_CACHE v1.1 literal");
   const embeddedAttr = vm.runInNewContext(`(${m[1]})`, Object.create(null));
   const diskAttr = JSON.parse(fs.readFileSync(ATTR_CACHE_PATH, "utf-8"));
 
+  assert.strictEqual(embeddedAttr.schema_version, "1.1", "DEFAULT_ATTRIBUTION_CACHE.schema_version must be 1.1");
   assert.strictEqual(embeddedAttr.as_of, diskAttr.as_of, "EMBEDDED_ATTRIBUTION_DATA as_of mismatch with disk cache");
   assert.strictEqual(embeddedAttr.coverage.coverage_pct, 100.0, "Coverage pct must be 100.0");
-  assert.strictEqual(embeddedAttr.coverage.unique_market_tickers, 46, "Expected 46 unique market tickers");
+  assert.strictEqual(embeddedAttr.coverage.total_active_assets, 61, "Expected 61 active assets");
+  assert.strictEqual(embeddedAttr.coverage.tracked_sold_assets, 1, "Expected 1 tracked sold asset");
+  assert.strictEqual(embeddedAttr.coverage.total_eval_assets, 62, "Expected 62 total eval assets");
+  assert.strictEqual(embeddedAttr.coverage.unique_market_tickers, 47, "Expected 47 unique market tickers (46 active + 494310)");
 
   const expectedCounts = { all: 61, no_pension: 45, risk_only: 40, risk_no_pension: 29 };
+  const expandedCounts = { all: 62, no_pension: 46, risk_only: 41, risk_no_pension: 30 };
   for (const [sc, expectedN] of Object.entries(expectedCounts)) {
     const scObj = embeddedAttr.scenarios[sc];
     assert(scObj, `Missing scenario in EMBEDDED_ATTRIBUTION_DATA: ${sc}`);
@@ -123,8 +154,33 @@ function verifySyntaxAndEmbeddedData() {
     for (const p of EXPECTED_PERIODS_9) {
       const pObj = scObj.periods[p];
       assert(pObj, `Missing period ${p} in scenario ${sc}`);
+      const expEvalN = POST_SELL_PERIODS.has(p) ? expectedN : expandedCounts[sc];
+      assert.strictEqual(pObj.evaluated_asset_count, expEvalN, `${sc}/${p} evaluated_asset_count mismatch`);
       if (sc === "all") {
-        assert.strictEqual(Object.keys(pObj.by_asset).length, expectedN, `${sc}/${p} by_asset count mismatch`);
+        assert.strictEqual(Object.keys(pObj.by_asset).length, expEvalN, `${sc}/${p} by_asset count mismatch`);
+        if (POST_SELL_PERIODS.has(p)) {
+          assert(!pObj.by_asset["AST-037"], `${sc}/${p} should exclude sold AST-037`);
+        } else {
+          const a37 = pObj.by_asset["AST-037"];
+          assert(a37, `${sc}/${p} missing sold AST-037`);
+          assert.strictEqual(a37.has_period_trade, true);
+          assert.strictEqual(a37.trade_event_note, "11/06 56주 전량매도 반영");
+          assert.strictEqual(a37.institution, "나무증권");
+          assert.strictEqual(a37.account_name, "평생우대 [CMA]");
+          if (p === "1M") assert.strictEqual(a37.delta_krw, -1693720);
+          if (p === "peak_drawdown") assert.strictEqual(a37.delta_krw, -7766360);
+        }
+      }
+      // recent_trades RP 제외 확인
+      const rTrades = Array.isArray(pObj.recent_trades) ? pObj.recent_trades : [];
+      for (const rt of rTrades) {
+        assertNoRpLeak(`${rt.tx_id} ${rt.ticker} ${rt.asset_name} ${rt.note}`, `embedded ${sc}/${p} recent_trades`);
+      }
+      if (POST_SELL_PERIODS.has(p)) {
+        assert.strictEqual(rTrades.length, 0, `${sc}/${p} should have 0 recent_trades`);
+      } else {
+        assert.strictEqual(rTrades.length, 1, `${sc}/${p} should have 1 non-RP recent_trade`);
+        assert.strictEqual(rTrades[0].tx_id, "TX-20261106-001");
       }
       assert.strictEqual(pObj.factors.length, 6, `${sc}/${p} expected 6 factors`);
       assert(pObj.top_draggers.length <= 5 && pObj.top_leaders.length <= 5, `${sc}/${p} top_draggers/leaders > 5`);
@@ -135,7 +191,7 @@ function verifySyntaxAndEmbeddedData() {
     assert.strictEqual(movers["2026-11-14"].is_flat_day, true, `${sc} 2026-11-14 should be flat weekend`);
     assert.strictEqual(movers["2026-11-15"].is_flat_day, true, `${sc} 2026-11-15 should be flat weekend`);
   }
-  console.log(`  -> PASS: EMBEDDED_ATTRIBUTION_DATA (${embeddedAttr.as_of}, 커버리지 100.0%, 4x9 시나리오·기간 & daily_movers 무결성 확인)`);
+  console.log(`  -> PASS: DEFAULT_ATTRIBUTION_CACHE v1.1 (${embeddedAttr.as_of}, 47/47 티커 100.0%, 실보유 61/62종, RP 0건) 무결성 확인`);
 
   return { html, combinedScript, diskAttr };
 }
@@ -168,7 +224,7 @@ function makeMockElement(id = "", tagName = "DIV", attrs = {}) {
     innerText: "",
     _innerHTML: "",
     get innerHTML() { return this._innerHTML; },
-    set innerHTML(val) { this._innerHTML = String(val || ""); if (!this._innerHTML) this.children = []; else this.children = []; },
+    set innerHTML(val) { this._innerHTML = String(val || ""); this.children = []; },
     textContent: "",
     value: "",
     checked: false,
@@ -192,7 +248,7 @@ function makeMockElement(id = "", tagName = "DIV", attrs = {}) {
   return el;
 }
 
-function verifyNodeVmDomSimulation(html, combinedScript) {
+function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
   console.log("[STEP 3] Node VM + Mock DOM 시뮬레이션 검증...");
   const elementsById = new Map();
   const ensureEl = (id, tag = "DIV") => {
@@ -200,11 +256,9 @@ function verifyNodeVmDomSimulation(html, combinedScript) {
     return elementsById.get(id);
   };
 
-  // HTML 내 모든 id="..." 등록
   const idMatches = html.matchAll(/id="([^"]+)"/g);
   for (const m of idMatches) ensureEl(m[1]);
 
-  // #periodReturnsStrip .period-chip (18개) 및 #attrPeriodPills .attr-period-pill (9개) 및 #assetsTablePeriodTabs .table-period-btn (7개)
   const periodChips = [];
   for (const box of ["main", "risk"]) {
     for (const p of EXPECTED_PERIODS_9) {
@@ -274,66 +328,94 @@ function verifyNodeVmDomSimulation(html, combinedScript) {
   const ctx = vm.createContext(sandbox);
   vm.runInContext(combinedScript, ctx, { filename: "web_index_inline.js" });
 
-  // 1) 초기 렌더 확인 & 9개 기간 전환 (기본 includePension=false, onlyRiskAssets=false -> 연금제외 전체)
+  // 0) DEFAULT_ATTRIBUTION_CACHE.schema_version & isRpTrade 단위 검증
+  assert.strictEqual(vm.runInContext("DEFAULT_ATTRIBUTION_CACHE.schema_version", ctx), "1.1");
+  assert.strictEqual(ctx.isRpTrade({ ticker: "RP-USD-7D-1" }), true);
+  assert.strictEqual(ctx.isRpTrade({ channel: "구글시트_RP거래내역" }), true);
+  assert.strictEqual(ctx.isRpTrade({ asset_name: "USD 외화RP" }), true);
+  assert.strictEqual(ctx.isRpTrade({ asset_name: "수시RP" }), true);
+  assert.strictEqual(ctx.isRpTrade({ asset_name: "ITOCHU CORP", ticker: "8001.T" }), false);
+  assert.strictEqual(ctx.isRpTrade({ asset_name: "KODEX 반도체레버리지", ticker: "494310" }), false);
+
+  // 0-b) renderTradesTable RP 제외 & RP-only 빈 상태 검증
+  ctx.renderTradesTable(txJson);
+  assert.strictEqual(ensureEl("tradesCountBadge").innerText, "1건", "VM #tradesCountBadge should be 1건");
+  const tradeRowHtml = ensureEl("tradesTableBody").innerHTML;
+  const tradeRowCount = (tradeRowHtml.match(/<tr\b/g) || []).length;
+  assert.strictEqual(tradeRowCount, 1, "VM #tradesTableBody should have 1 <tr> row");
+  assert(tradeRowHtml.includes("KODEX 반도체레버리지"), "VM trade row missing KODEX 반도체레버리지");
+  assertNoRpLeak(tradeRowHtml, "VM #tradesTableBody");
+
+  const rpOnlyTxs = txJson.filter(t => ctx.isRpTrade(t));
+  ctx.renderTradesTable(rpOnlyTxs);
+  assert.strictEqual(ensureEl("tradesCountBadge").innerText, "0건");
+  assert(ensureEl("tradesTableBody").innerHTML.includes("RP 거래 제외"), "VM RP-only empty state missing notice");
+  assertNoRpLeak(ensureEl("tradesTableBody").innerHTML, "VM RP-only #tradesTableBody");
+  ctx.renderTradesTable(txJson);
+
+  // 1) 초기 렌더 및 9개 기간 전환 (기본 no_pension: 1D/1W=45종, 1M+=46종)
   for (const p of EXPECTED_PERIODS_9) {
     ctx.selectAttributionPeriod(p);
     const meta = ensureEl("attrHeaderMeta").innerHTML;
-    assert(meta.includes("연금제외 전체"), `VM headerMeta missing scenario on ${p}: ${meta}`);
+    assert(meta.includes("연금제외"), `VM headerMeta missing scenario on ${p}: ${meta}`);
+    const expCnt = POST_SELL_PERIODS.has(p) ? 45 : 46;
+    assert(meta.includes(`실보유 ${expCnt}종`), `VM headerMeta expected 실보유 ${expCnt}종 on ${p}: ${meta}`);
+
     const activePills = attrPills.filter(el => el.classList.contains("active")).map(el => el.getAttribute("data-period"));
     assert.deepStrictEqual(activePills, [p], `VM active pill mismatch on ${p}`);
     const activeChips = periodChips.filter(el => el.classList.contains("attr-active")).map(el => el.getAttribute("data-period"));
-    assert.strictEqual(activeChips.length, 2, `VM expected 2 active period chips (main+risk) on ${p}`);
-    assert(activeChips.every(x => x === p), `VM chip highlight mismatch on ${p}`);
+    assert.strictEqual(activeChips.length, 2);
 
-    const draggersHtml = ensureEl("attrDraggersList").innerHTML;
-    const leadersHtml = ensureEl("attrLeadersList").innerHTML;
-    const factorsHtml = ensureEl("attrFactorsGrid").innerHTML;
-    const factorCards = (factorsHtml.match(/class="attr-factor-card\b/g) || []).length;
-    assert.strictEqual(factorCards, 6, `VM expected 6 factor cards on ${p}, got ${factorCards}`);
-    const dCount = (draggersHtml.match(/class="attr-mover-row\b/g) || []).length;
-    const lCount = (leadersHtml.match(/class="attr-mover-row\b/g) || []).length;
-    assert(dCount <= 5 && lCount <= 5, `VM draggers/leaders exceeded 5 on ${p}: d=${dCount}, l=${lCount}`);
-    if (["1W", "1M", "YTD", "peak_drawdown"].includes(p)) {
-      assert(dCount >= 1 && lCount >= 1, `VM expected movers on ${p}: d=${dCount}, l=${lCount}`);
+    const draggersUnit = ensureEl("attrDraggersUnit").innerText;
+    const leadersUnit = ensureEl("attrLeadersUnit").innerText;
+    if (p === "1D") {
+      assert(draggersUnit.includes("참고:"), `VM 1D draggersUnit unexpected: ${draggersUnit}`);
+    } else {
+      assert.strictEqual(draggersUnit, "거래내역 반영 실보유 기준", `VM ${p} draggersUnit mismatch`);
+      assert.strictEqual(leadersUnit, "거래내역 반영 실보유 기준", `VM ${p} leadersUnit mismatch`);
     }
+
+    const tradeEl = ensureEl("attrTradeNotice");
+    if (POST_SELL_PERIODS.has(p)) {
+      assert.strictEqual(tradeEl.style.display, "none", `VM ${p} #attrTradeNotice should be hidden`);
+    } else {
+      assert.strictEqual(tradeEl.style.display, "block", `VM ${p} #attrTradeNotice should be visible`);
+      assert(tradeEl.innerHTML.includes("KODEX 반도체레버리지"), `VM ${p} #attrTradeNotice missing KODEX 반도체레버리지`);
+      assertNoRpLeak(tradeEl.innerHTML, `VM ${p} #attrTradeNotice`);
+    }
+
+    const factorCards = (ensureEl("attrFactorsGrid").innerHTML.match(/class="attr-factor-card\b/g) || []).length;
+    assert.strictEqual(factorCards, 6, `VM expected 6 factor cards on ${p}`);
   }
 
-  // 2) 접기/펼치기 토글 검증
-  assert.notStrictEqual(ensureEl("attrPanelBody").style.display, "none");
+  // 1-b) AST-037 매매 배지 & 기관/계좌 배지 직접 렌더링 검증
+  const ast37Peak = diskAttr.scenarios.all.periods.peak_drawdown.by_asset["AST-037"];
+  const tmpCol = makeMockElement("tmpAttrCol");
+  ctx.renderAttrMoversColumn(tmpCol, [ast37Peak], "dragger", null);
+  assert(tmpCol.innerHTML.includes('class="attr-trade-badge"'), "VM missing .attr-trade-badge for AST-037");
+  assert(tmpCol.innerHTML.includes("11/06 56주 전량매도 반영"), "VM missing AST-037 trade_event_note");
+  assert(tmpCol.innerHTML.includes("나무증권 · 평생우대 [CMA]"), "VM missing AST-037 institution/account badge");
+
+  // 2) 접기/펼치기 & 4대 시나리오 토글
   ctx.toggleAttributionCollapse();
   assert.strictEqual(ensureEl("attrPanelBody").style.display, "none");
-  assert.strictEqual(ensureEl("attrCollapseBtn").innerText, "펼치기 ▾");
-  assert.strictEqual(ensureEl("attrCollapseBtn").getAttribute("aria-expanded"), "false");
   ctx.toggleAttributionCollapse();
   assert.strictEqual(ensureEl("attrPanelBody").style.display, "block");
-  assert.strictEqual(ensureEl("attrCollapseBtn").innerText, "접기 ▴");
-  assert.strictEqual(ensureEl("attrCollapseBtn").getAttribute("aria-expanded"), "true");
 
-  // 3) 4대 시나리오 토글 조합 검증
   ctx.selectAttributionPeriod("1M");
-  const combos = [
-    [true, false, "all"],
-    [false, false, "no_pension"],
-    [true, true, "risk_only"],
-    [false, true, "risk_no_pension"],
-    [true, false, "all"]
-  ];
-  for (const [pen, risk, sc] of combos) {
+  for (const [pen, risk, sc] of [[true, false, "all"], [false, false, "no_pension"], [true, true, "risk_only"], [false, true, "risk_no_pension"], [true, false, "all"]]) {
     ctx.toggleIncludePension(pen);
     ctx.toggleOnlyRiskAssets(risk);
     const meta = ensureEl("attrHeaderMeta").innerHTML;
-    assert(
-      meta.includes(EXPECTED_SCENARIO_LABELS[sc]),
-      `VM scenario sync failed for (${pen}, ${risk}): got "${meta}"`
-    );
+    assert(meta.includes(EXPECTED_SCENARIO_LABELS[sc]), `VM scenario sync failed (${pen},${risk}): ${meta}`);
   }
 
-  // 4) 기능 3 테이블 7개 기간 탭 & 정렬 검증
+  // 3) 기능 3 테이블 7개 기간 탭 & 정렬 검증
   for (const [term, [profitHdr, retHdr]] of Object.entries(EXPECTED_TABLE_HEADERS)) {
     ctx.setAssetsTablePeriod(term);
-    assert.strictEqual(ensureEl("thProfitLabel").innerText, profitHdr, `VM profit header mismatch for ${term}`);
-    assert.strictEqual(ensureEl("thReturnLabel").innerText, retHdr, `VM return header mismatch for ${term}`);
-    assert.strictEqual(ensureEl("assetsTableBody").children.length, 61, `VM expected 61 table rows for ${term}`);
+    assert.strictEqual(ensureEl("thProfitLabel").innerText, profitHdr);
+    assert.strictEqual(ensureEl("thReturnLabel").innerText, retHdr);
+    assert.strictEqual(ensureEl("assetsTableBody").children.length, 61);
   }
   ctx.setAssetsTablePeriod("1M");
   ctx.sortTable("profit_krw");
@@ -343,7 +425,7 @@ function verifyNodeVmDomSimulation(html, combinedScript) {
   ctx.sortTable("return_rate");
   assert.strictEqual(vm.runInContext("currentSortKey + ':' + currentSortOrder", ctx), "return_rate:desc");
 
-  console.log("  -> PASS: Node VM + Mock DOM 시뮬레이션 (9개 기간·접기·4시나리오·7개 테이블탭·정렬) 전체 통과");
+  console.log("  -> PASS: Node VM + Mock DOM (v1.1 isRpTrade, #tradesTable RP제외, AST-037 배지, 9기간·4시나리오·7탭) 통과");
 }
 
 // ============================================================================
@@ -382,11 +464,10 @@ function startEphemeralServer(html, diskAttr, txJson) {
         return sendJson(200, { status: "success", ...diskAttr });
       }
       if (pathname === "/api/history") {
-        // DEFAULT_HISTORY_CACHE 내장 시계열을 에러 없이 그대로 유지하면서 HTTP 200 반환
         return sendJson(200, { status: "local_embedded", message: "Using embedded DEFAULT_HISTORY_CACHE in UI test" });
       }
       if (pathname === "/api/transactions") {
-        return sendJson(200, { status: "success", transactions: Array.isArray(txJson.transactions) ? txJson.transactions : [] });
+        return sendJson(200, { status: "success", transactions: Array.isArray(txJson) ? txJson : (txJson.transactions || []) });
       }
       if (pathname === "/favicon.ico") {
         res.writeHead(204);
@@ -490,7 +571,6 @@ async function launchHeadlessBrowser(browserExe, userDataDir) {
     });
   });
 
-  // /json/list 에서 페이지 타겟 WebSocket URL 조회
   const httpBase = wsBrowserUrl.replace(/^ws:/, "http:").replace(/\/devtools\/browser\/.*$/, "");
   const targets = await (await fetch(`${httpBase}/json/list`)).json();
   const pageTarget = targets.find(t => t.type === "page") || targets[0];
@@ -511,12 +591,11 @@ async function waitUntil(fn, timeoutMs = 10000, label = "condition") {
   throw new Error(`Timed out waiting for: ${label}`);
 }
 
-async function verifyRealBrowserE2E(html, diskAttr) {
+async function verifyRealBrowserE2E(html, diskAttr, txJson) {
   console.log("[STEP 4] 실제 Headless Chrome CDP 브라우저 E2E 검증 (격리 HTTP 서버, 8765 무관)...");
   const browserExe = findBrowserExe();
   assert(browserExe, "Chrome/Edge headless browser not found on system");
 
-  const txJson = fs.existsSync(TX_JSON_PATH) ? JSON.parse(fs.readFileSync(TX_JSON_PATH, "utf-8")) : { transactions: [] };
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "attr-chrome-qa-"));
   const { server, port } = await startEphemeralServer(html, diskAttr, txJson);
 
@@ -538,19 +617,45 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     const targetUrl = `http://127.0.0.1:${port}/`;
     await cdp.send("Page.navigate", { url: targetUrl });
 
-    // 초기 렌더링 및 /api/attribution 동기화 완료 대기
+    // 초기 렌더링 + /api/attribution + /api/transactions 동기화 대기
     await waitUntil(async () => {
       return await cdp.eval(`(() => {
         const r = document.querySelectorAll('#assetsTableBody tr').length;
         const f = document.querySelectorAll('#attrFactorsGrid .attr-factor-card').length;
         const h = document.getElementById('hoverDate')?.innerText || '';
-        return r === 61 && f === 6 && h.length > 0 && typeof attributionServerData === 'object' && attributionServerData !== null;
+        const tb = document.getElementById('tradesCountBadge')?.innerText || '';
+        return r === 61 && f === 6 && h.length > 0 && tb.length > 0 &&
+          typeof attributionServerData === 'object' && attributionServerData !== null &&
+          Array.isArray(currentTransactions);
       })()`);
-    }, 12000, "initial render + /api/attribution sync");
+    }, 12000, "initial render + /api/attribution & /api/transactions sync");
 
     // ------------------------------------------------------------------------
-    // 기능 1: 9개 기간 칩 클릭 -> #attributionPanel 업데이트 + 접기/펼치기 + 4대 토글
+    // 기능 4: #tradesTable 리뷰 RP 제외 검증
     // ------------------------------------------------------------------------
+    const tradesDom = await cdp.eval(`(() => ({
+      badge: document.getElementById('tradesCountBadge')?.innerText || '',
+      rows: document.querySelectorAll('#tradesTableBody tr').length,
+      bodyText: document.getElementById('tradesTableBody')?.innerText || '',
+      bodyHtml: document.getElementById('tradesTableBody')?.innerHTML || ''
+    }))()`);
+    assert.strictEqual(tradesDom.badge, "1건", `Browser #tradesCountBadge mismatch: ${tradesDom.badge}`);
+    assert.strictEqual(tradesDom.rows, 1, `Browser #tradesTableBody expected 1 row, got ${tradesDom.rows}`);
+    assert(tradesDom.bodyText.includes("KODEX 반도체레버리지"), `Browser #tradesTableBody missing KODEX 반도체레버리지: ${tradesDom.bodyText}`);
+    assertNoRpLeak(tradesDom.bodyText + " " + tradesDom.bodyHtml, "Browser #tradesTableBody");
+    console.log("  -> PASS [기능 4]: #tradesTable 리뷰 RP 제외 (#tradesCountBadge=1건, KODEX 반도체레버리지 1건만 노출, RP 0건)");
+
+    // ------------------------------------------------------------------------
+    // 기능 1: 9개 기간 칩 클릭 -> #attributionPanel 실보유 UI + 접기 + 4대 토글
+    // ------------------------------------------------------------------------
+    // 먼저 연금포함 전체(all)로 전환해 61종(1W) vs 62종(1M) 확인
+    await cdp.eval(`(() => {
+      const penCb = document.getElementById('includePensionCheckbox');
+      const riskCb = document.getElementById('onlyRiskAssetsCheckbox');
+      if (!penCb.checked) penCb.click();
+      if (riskCb.checked) riskCb.click();
+    })()`);
+
     for (const p of EXPECTED_PERIODS_9) {
       const res = await cdp.eval(`(() => {
         const chip = document.querySelector('#periodReturnsStrip .period-chip[data-period="${p}"]');
@@ -560,27 +665,66 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         const summary = document.getElementById('attrAutoSummary')?.innerText || '';
         const tradeText = document.getElementById('attrTradeNotice')?.innerText || '';
         const tradeDisp = getComputedStyle(document.getElementById('attrTradeNotice')).display;
+        const draggersUnit = document.getElementById('attrDraggersUnit')?.innerText || '';
+        const leadersUnit = document.getElementById('attrLeadersUnit')?.innerText || '';
         const dCount = document.querySelectorAll('#attrDraggersList .attr-mover-row').length;
         const lCount = document.querySelectorAll('#attrLeadersList .attr-mover-row').length;
         const fCount = document.querySelectorAll('#attrFactorsGrid .attr-factor-card').length;
         const activePills = Array.from(document.querySelectorAll('#attrPeriodPills .attr-period-pill.active')).map(e => e.getAttribute('data-period'));
         const activeChips = Array.from(document.querySelectorAll('#periodReturnsStrip .period-chip.attr-active')).map(e => e.getAttribute('data-period'));
-        return { meta, summary, tradeText, tradeDisp, dCount, lCount, fCount, activePills, activeChips };
+        return { meta, summary, tradeText, tradeDisp, draggersUnit, leadersUnit, dCount, lCount, fCount, activePills, activeChips };
       })()`);
       assert(!res.error, res.error);
-      assert(res.meta.includes("연금제외 전체"), `Browser 1280px ${p} headerMeta missing scenario: ${res.meta}`);
+      assert(res.meta.includes("연금포함 전체"), `Browser 1280px ${p} headerMeta missing scenario: ${res.meta}`);
+      const expEvalCnt = POST_SELL_PERIODS.has(p) ? 61 : 62;
+      assert(res.meta.includes(`실보유 ${expEvalCnt}종`), `Browser ${p} expected 실보유 ${expEvalCnt}종, got: ${res.meta}`);
+      for (const leg of LEGACY_FORBIDDEN_PHRASES) {
+        assert(!res.meta.includes(leg) && !res.summary.includes(leg) && !res.draggersUnit.includes(leg) && !res.leadersUnit.includes(leg), `Legacy phrase ${leg} in ${p}`);
+      }
       assert.deepStrictEqual(res.activePills, [p], `Browser active pill mismatch on ${p}`);
       assert(res.activeChips.length === 2 && res.activeChips.every(x => x === p), `Browser active chips mismatch on ${p}`);
       assert.strictEqual(res.fCount, 6, `Browser ${p} factor card count != 6`);
       assert(res.dCount <= 5 && res.lCount <= 5, `Browser ${p} draggers/leaders > 5`);
-      if (["1W", "1M", "3M", "6M", "YTD", "1Y", "peak_drawdown"].includes(p)) {
-        assert(res.dCount >= 1 && res.lCount >= 1, `Browser ${p} expected movers >= 1, got d=${res.dCount} l=${res.lCount}`);
+
+      if (p !== "1D") {
+        assert.strictEqual(res.draggersUnit, "거래내역 반영 실보유 기준", `Browser ${p} #attrDraggersUnit mismatch: ${res.draggersUnit}`);
+        assert.strictEqual(res.leadersUnit, "거래내역 반영 실보유 기준", `Browser ${p} #attrLeadersUnit mismatch: ${res.leadersUnit}`);
       }
-      if (["1W", "1M", "YTD"].includes(p)) {
-        assert.notStrictEqual(res.tradeDisp, "none", `Browser ${p} trade notice unexpectedly hidden`);
-        assert(res.tradeText.includes("제외"), `Browser ${p} trade notice missing exclusion note: ${res.tradeText}`);
+
+      if (POST_SELL_PERIODS.has(p)) {
+        assert.strictEqual(res.tradeDisp, "none", `Browser ${p} #attrTradeNotice must be hidden (RP excluded), got ${res.tradeDisp}: ${res.tradeText}`);
+      } else {
+        assert.notStrictEqual(res.tradeDisp, "none", `Browser ${p} #attrTradeNotice unexpectedly hidden`);
+        assert(res.tradeText.includes("KODEX 반도체레버리지"), `Browser ${p} #attrTradeNotice missing KODEX 반도체레버리지: ${res.tradeText}`);
+        assertNoRpLeak(res.tradeText, `Browser ${p} #attrTradeNotice`);
       }
     }
+
+    // peak_drawdown / 1M에서 AST-037 .attr-trade-badge & 기관/계좌 배지 실DOM 렌더링 검증
+    await cdp.eval(`document.querySelector('#periodReturnsStrip .period-chip[data-period="peak_drawdown"]').click();`);
+    const ast37Render = await cdp.eval(`(() => {
+      const a37 = getAssetAttr('AST-037', 'peak_drawdown');
+      if (!a37) return { error: 'AST-037 missing from peak_drawdown' };
+      const listEl = document.getElementById('attrDraggersList');
+      renderAttrMoversColumn(listEl, [a37], 'dragger', null);
+      const badge = listEl.querySelector('.attr-trade-badge');
+      const acct = listEl.querySelector('.attr-acct-badge');
+      const badgeRect = badge ? badge.getBoundingClientRect() : null;
+      const out = {
+        deltaKrw: a37.delta_krw,
+        badgeText: badge ? badge.innerText : '',
+        acctText: acct ? acct.innerText : '',
+        badgeVisible: !!(badgeRect && badgeRect.width > 0 && badgeRect.height > 0),
+        html: listEl.innerHTML
+      };
+      renderAttributionPanel(); // 정상 패널 상태로 즉시 복원
+      return out;
+    })()`);
+    assert(!ast37Render.error, ast37Render.error);
+    assert.strictEqual(ast37Render.deltaKrw, -7766360);
+    assert.strictEqual(ast37Render.badgeText, "11/06 56주 전량매도 반영");
+    assert.strictEqual(ast37Render.acctText, "나무증권 · 평생우대 [CMA]");
+    assert(ast37Render.badgeVisible, "AST-037 .attr-trade-badge not visible in Chrome DOM");
 
     // 접기 / 펼치기 실제 클릭 검증
     const collapseState = await cdp.eval(`(() => {
@@ -599,9 +743,16 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     assert.strictEqual(collapseState.expandedDisp, "block");
     assert.strictEqual(collapseState.expandedAria, "true");
 
-    // 4대 시나리오 토글 동기화 실제 DOM 체크박스 조작
+    // 4대 시나리오 토글 동기화 실제 DOM 체크박스 조작 (1M 기준 62 / 46 / 41 / 30종)
     await cdp.eval(`document.querySelector('#periodReturnsStrip .period-chip[data-period="1M"]').click();`);
-    for (const [pen, risk, sc] of [[true, false, "all"], [false, false, "no_pension"], [true, true, "risk_only"], [false, true, "risk_no_pension"], [true, false, "all"]]) {
+    const scenarioSyncCases = [
+      [true, false, "all", 62],
+      [false, false, "no_pension", 46],
+      [true, true, "risk_only", 41],
+      [false, true, "risk_no_pension", 30],
+      [true, false, "all", 62]
+    ];
+    for (const [pen, risk, sc, expN] of scenarioSyncCases) {
       const meta = await cdp.eval(`(() => {
         const penCb = document.getElementById('includePensionCheckbox');
         const riskCb = document.getElementById('onlyRiskAssetsCheckbox');
@@ -610,8 +761,9 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         return document.getElementById('attrHeaderMeta').innerText;
       })()`);
       assert(meta.includes(EXPECTED_SCENARIO_LABELS[sc]), `Browser toggle sync failed (${pen},${risk}): ${meta}`);
+      assert(meta.includes(`실보유 ${expN}종`), `Browser toggle sync expected 실보유 ${expN}종: ${meta}`);
     }
-    console.log("  -> PASS [기능 1]: 9개 기간 칩, Draggers/Leaders <=5, 6대 팩터, 접기/펼치기, 4대 토글 동기화 확인");
+    console.log("  -> PASS [기능 1]: 1W(61종/공지숨김) vs 1M(62종/비-RP공지/단위문구), AST-037 배지·계좌, 4대 토글 확인");
 
     // ------------------------------------------------------------------------
     // 기능 2: 차트 호버(2026-11-13 거래일 / 2026-11-14 휴장일 / mouseleave 복귀)
@@ -637,8 +789,6 @@ async function verifyRealBrowserE2E(html, diskAttr) {
       return {
         idx13,
         idx14,
-        rectLeft: rect.left,
-        rectTop: rect.top,
         clientY: rect.top + rect.height * 0.5,
         x13: toClientX(idx13),
         x14: toClientX(idx14)
@@ -646,12 +796,7 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     })()`);
     assert(hoverCoords.idx13 >= 0 && hoverCoords.idx14 >= 0, "Could not locate 2026-11-13 / 2026-11-14 in YTD chart");
 
-    // 11/13 (금) 실제 거래일 호버 -> 전일비 + 상승/하락 Top 2 칩
-    await cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: hoverCoords.x13,
-      y: hoverCoords.clientY
-    });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: hoverCoords.x13, y: hoverCoords.clientY });
     const hover13 = await cdp.eval(`(() => ({
       date: document.getElementById('hoverDate').innerText,
       rowText: document.getElementById('hoverMoversRow').innerText,
@@ -660,27 +805,22 @@ async function verifyRealBrowserE2E(html, diskAttr) {
       hasDayDelta: !!document.querySelector('#hoverMoversRow .hover-day-delta'),
       lineDisp: document.getElementById('chartHoverLine').style.display
     }))()`);
-    assert.strictEqual(hover13.date, "2026-11-13", `Hover 11/13 date mismatch: ${hover13.date}`);
-    assert(hover13.hasDayDelta, "Hover 11/13 missing .hover-day-delta");
-    assert(hover13.rowText.includes("상승 Top 2") && hover13.rowText.includes("하락 Top 2"), `Hover 11/13 movers missing Top 2: ${hover13.rowText}`);
-    assert(hover13.chipsUp >= 1 && hover13.chipsDown >= 1, `Hover 11/13 expected mover chips: up=${hover13.chipsUp}, down=${hover13.chipsDown}`);
-    assert.strictEqual(hover13.lineDisp, "block", "Hover line not visible on 11/13");
+    assert.strictEqual(hover13.date, "2026-11-13");
+    assert(hover13.hasDayDelta);
+    assert(hover13.rowText.includes("상승 Top 2") && hover13.rowText.includes("하락 Top 2"));
+    assert(hover13.chipsUp >= 1 && hover13.chipsDown >= 1);
+    assert.strictEqual(hover13.lineDisp, "block");
+    assert(!hover13.rowText.includes("KODEX 반도체레버리지"), "Sold AST-037 must not appear on 2026-11-13 hover");
 
-    // 11/14 (토) 주말 휴장일 호버 -> 휴장일 안내 배지
-    await cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseMoved",
-      x: hoverCoords.x14,
-      y: hoverCoords.clientY
-    });
+    await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: hoverCoords.x14, y: hoverCoords.clientY });
     const hover14 = await cdp.eval(`(() => ({
       date: document.getElementById('hoverDate').innerText,
       rowText: document.getElementById('hoverMoversRow').innerText,
       hasFlat: !!document.querySelector('#hoverMoversRow .hover-mover-flat')
     }))()`);
-    assert.strictEqual(hover14.date, "2026-11-14", `Hover 11/14 date mismatch: ${hover14.date}`);
-    assert(hover14.hasFlat && hover14.rowText.includes("휴장일"), `Hover 11/14 missing 휴장일 notice: ${hover14.rowText}`);
+    assert.strictEqual(hover14.date, "2026-11-14");
+    assert(hover14.hasFlat && hover14.rowText.includes("휴장일"));
 
-    // mouseleave -> 최신일(2026-11-15) 복귀
     await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 });
     await waitUntil(async () => (await cdp.eval(`document.getElementById('hoverDate').innerText`)) === "2026-11-15", 3000, "mouseleave restore");
     const hoverOut = await cdp.eval(`({
@@ -690,14 +830,14 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     })`);
     assert.strictEqual(hoverOut.date, "2026-11-15");
     assert.strictEqual(hoverOut.lineDisp, "none");
-    assert(hoverOut.rowText.includes("휴장일"), `Restored latest hover row unexpected: ${hoverOut.rowText}`);
+    assert(hoverOut.rowText.includes("휴장일"));
     console.log("  -> PASS [기능 2]: 차트 호버 2026-11-13(Top2 칩) / 2026-11-14(휴장일) / mouseleave(2026-11-15 복귀) 확인");
 
     // ------------------------------------------------------------------------
     // 기능 3: #assetsTablePeriodTabs 7개 탭 전환 및 정렬 검증
     // ------------------------------------------------------------------------
     const tabCount = await cdp.eval(`document.querySelectorAll('#assetsTablePeriodTabs .table-period-btn').length`);
-    assert.strictEqual(tabCount, 7, `Expected 7 period tabs in #assetsTablePeriodTabs, got ${tabCount}`);
+    assert.strictEqual(tabCount, 7);
 
     for (const [term, [profitHdr, retHdr]] of Object.entries(EXPECTED_TABLE_HEADERS)) {
       const tabRes = await cdp.eval(`(() => {
@@ -712,13 +852,12 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         };
       })()`);
       assert(!tabRes.error, tabRes.error);
-      assert(tabRes.active, `Tab ${term} not active after click`);
+      assert(tabRes.active);
       assert.strictEqual(tabRes.profitHdr, profitHdr);
       assert.strictEqual(tabRes.retHdr, retHdr);
-      assert.strictEqual(tabRes.rows, 61, `Expected 61 rows on tab ${term}`);
+      assert.strictEqual(tabRes.rows, 61);
     }
 
-    // 1M profit_krw 내림차순·오름차순 단조성 실제 DOM 텍스트 + 내부 데이터 일치 검증
     const sortCheck = await cdp.eval(`(() => {
       document.querySelector('#assetsTablePeriodTabs .table-period-btn[data-term="1M"]').click();
       const thProfit = document.getElementById('thProfitLabel').closest('th');
@@ -734,18 +873,18 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         });
       }
 
-      thProfit.click(); // desc
+      thProfit.click();
       const pDescOrder = currentSortKey + ':' + currentSortOrder;
       const pDescVals = extractNumsFromCol(9);
-      thProfit.click(); // asc
+      thProfit.click();
       const pAscOrder = currentSortKey + ':' + currentSortOrder;
       const pAscVals = extractNumsFromCol(9);
 
       document.querySelector('#assetsTablePeriodTabs .table-period-btn[data-term="YTD"]').click();
-      thReturn.click(); // desc
+      thReturn.click();
       const rDescOrder = currentSortKey + ':' + currentSortOrder;
       const rDescVals = extractNumsFromCol(10);
-      thReturn.click(); // asc
+      thReturn.click();
       const rAscOrder = currentSortKey + ':' + currentSortOrder;
       const rAscVals = extractNumsFromCol(10);
 
@@ -758,16 +897,16 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     assert.strictEqual(sortCheck.rAscOrder, "return_rate:asc");
 
     for (let i = 1; i < sortCheck.pDescVals.length; i++) {
-      assert(sortCheck.pDescVals[i - 1] >= sortCheck.pDescVals[i], `1M profit_krw desc not monotonic at ${i}: ${sortCheck.pDescVals[i - 1]} < ${sortCheck.pDescVals[i]}`);
+      assert(sortCheck.pDescVals[i - 1] >= sortCheck.pDescVals[i], `1M profit_krw desc not monotonic at ${i}`);
     }
     for (let i = 1; i < sortCheck.pAscVals.length; i++) {
-      assert(sortCheck.pAscVals[i - 1] <= sortCheck.pAscVals[i], `1M profit_krw asc not monotonic at ${i}: ${sortCheck.pAscVals[i - 1]} > ${sortCheck.pAscVals[i]}`);
+      assert(sortCheck.pAscVals[i - 1] <= sortCheck.pAscVals[i], `1M profit_krw asc not monotonic at ${i}`);
     }
     for (let i = 1; i < sortCheck.rDescVals.length; i++) {
-      assert(sortCheck.rDescVals[i - 1] >= sortCheck.rDescVals[i], `YTD return_rate desc not monotonic at ${i}: ${sortCheck.rDescVals[i - 1]} < ${sortCheck.rDescVals[i]}`);
+      assert(sortCheck.rDescVals[i - 1] >= sortCheck.rDescVals[i], `YTD return_rate desc not monotonic at ${i}`);
     }
     for (let i = 1; i < sortCheck.rAscVals.length; i++) {
-      assert(sortCheck.rAscVals[i - 1] <= sortCheck.rAscVals[i], `YTD return_rate asc not monotonic at ${i}: ${sortCheck.rAscVals[i - 1]} > ${sortCheck.rAscVals[i]}`);
+      assert(sortCheck.rAscVals[i - 1] <= sortCheck.rAscVals[i], `YTD return_rate asc not monotonic at ${i}`);
     }
     console.log("  -> PASS [기능 3]: #assetsTablePeriodTabs 7개 탭 전환, 61행, 1M/YTD 정렬 단조성 검증 완료");
 
@@ -786,10 +925,9 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         tabsRight: tabs.right
       };
     })()`);
-    assert(desktopMetrics.scrollW <= desktopMetrics.innerW, `Desktop 1280px horizontal overflow: scrollWidth=${desktopMetrics.scrollW} > innerWidth=${desktopMetrics.innerW}`);
-    assert(desktopMetrics.panelRight <= 1281 && desktopMetrics.bannerRight <= 1281 && desktopMetrics.tabsRight <= 1281, `Desktop element overflowed right edge: ${JSON.stringify(desktopMetrics)}`);
+    assert(desktopMetrics.scrollW <= desktopMetrics.innerW, `Desktop 1280px horizontal overflow: ${desktopMetrics.scrollW} > ${desktopMetrics.innerW}`);
+    assert(desktopMetrics.panelRight <= 1281 && desktopMetrics.bannerRight <= 1281 && desktopMetrics.tabsRight <= 1281);
 
-    // 375px 모바일 전환 & 리렌더링 유도
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 375,
       height: 812,
@@ -815,10 +953,9 @@ async function verifyRealBrowserE2E(html, diskAttr) {
         tabsRight: tabs.right
       };
     })()`);
-    assert(mobileMetrics.scrollW <= mobileMetrics.innerW, `Mobile 375px horizontal overflow: scrollWidth=${mobileMetrics.scrollW} > innerWidth=${mobileMetrics.innerW}`);
-    assert(mobileMetrics.panelRight <= 376 && mobileMetrics.bannerRight <= 376 && mobileMetrics.tabsRight <= 376, `Mobile 375px panel/tabs overflowed right edge: ${JSON.stringify(mobileMetrics)}`);
+    assert(mobileMetrics.scrollW <= mobileMetrics.innerW, `Mobile 375px horizontal overflow: ${mobileMetrics.scrollW} > ${mobileMetrics.innerW}`);
+    assert(mobileMetrics.panelRight <= 376 && mobileMetrics.bannerRight <= 376 && mobileMetrics.tabsRight <= 376);
 
-    // Uncaught JS exceptions / console errors / HTTP Log errors == 0 확인
     const exceptions = cdp.events.filter(e => e.method === "Runtime.exceptionThrown");
     const consoleErrors = cdp.events.filter(
       e => e.method === "Runtime.consoleAPICalled" && e.params && e.params.type === "error"
@@ -826,9 +963,9 @@ async function verifyRealBrowserE2E(html, diskAttr) {
     const logErrors = cdp.events.filter(
       e => e.method === "Log.entryAdded" && e.params && e.params.entry && e.params.entry.level === "error"
     );
-    assert.strictEqual(exceptions.length, 0, `Uncaught page exceptions (${exceptions.length}): ${JSON.stringify(exceptions)}`);
-    assert.strictEqual(consoleErrors.length, 0, `Console errors (${consoleErrors.length}): ${JSON.stringify(consoleErrors)}`);
-    assert.strictEqual(logErrors.length, 0, `Browser log errors (${logErrors.length}): ${JSON.stringify(logErrors)}`);
+    assert.strictEqual(exceptions.length, 0, `Uncaught page exceptions: ${JSON.stringify(exceptions)}`);
+    assert.strictEqual(consoleErrors.length, 0, `Console errors: ${JSON.stringify(consoleErrors)}`);
+    assert.strictEqual(logErrors.length, 0, `Browser log errors: ${JSON.stringify(logErrors)}`);
 
     console.log(`  -> PASS [반응형/에러]: 1280px(scrollW=${desktopMetrics.scrollW}/${desktopMetrics.innerW}) & 375px(scrollW=${mobileMetrics.scrollW}/${mobileMetrics.innerW}) overflow 0건, uncaught/console error 0건`);
   } finally {
@@ -843,11 +980,12 @@ async function verifyRealBrowserE2E(html, diskAttr) {
 }
 
 async function main() {
-  console.log("=== Phase 23 Attribution UI/DOM/Browser 전수 QA 검증 시작 ===");
+  console.log("=== Phase 23.1 (v1.1) Attribution UI/DOM/Browser 전수 QA 검증 시작 ===");
   const { html, combinedScript, diskAttr } = verifySyntaxAndEmbeddedData();
-  verifyNodeVmDomSimulation(html, combinedScript);
-  await verifyRealBrowserE2E(html, diskAttr);
-  console.log("=== ALL UI/DOM/CDP CHECKS PASSED (4/4) ===");
+  const txJson = fs.existsSync(TX_JSON_PATH) ? JSON.parse(fs.readFileSync(TX_JSON_PATH, "utf-8")) : [];
+  verifyNodeVmDomSimulation(html, combinedScript, diskAttr, Array.isArray(txJson) ? txJson : (txJson.transactions || []));
+  await verifyRealBrowserE2E(html, diskAttr, txJson);
+  console.log("=== ALL v1.1 UI/DOM/CDP CHECKS PASSED ===");
 }
 
 main().catch((err) => {

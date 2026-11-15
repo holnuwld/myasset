@@ -55,15 +55,15 @@ with open(os.path.join(DATA_DIR, "calculated_history_cache.json"), "r", encoding
 def load_compact_attribution_raw(attr_path):
     """Load data/attribution_cache.json and compact it for offline HTML embedding."""
     if not os.path.exists(attr_path):
-        return json.dumps({"schema_version": "1.0", "status": "empty", "scenarios": {}}, ensure_ascii=False)
+        return json.dumps({"schema_version": "1.1", "status": "empty", "scenarios": {}}, ensure_ascii=False)
     try:
         with open(attr_path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
     except Exception:
-        return json.dumps({"schema_version": "1.0", "status": "error", "scenarios": {}}, ensure_ascii=False)
+        return json.dumps({"schema_version": "1.1", "status": "error", "scenarios": {}}, ensure_ascii=False)
 
     compact = {
-        "schema_version": raw_data.get("schema_version", "1.0"),
+        "schema_version": raw_data.get("schema_version", "1.1"),
         "status": raw_data.get("status", "success"),
         "as_of": raw_data.get("as_of", ""),
         "updated_at": raw_data.get("updated_at", ""),
@@ -78,6 +78,13 @@ def load_compact_attribution_raw(attr_path):
                 p_obj["by_asset"] = {
                     aid: {
                         "asset_id": ar.get("asset_id"),
+                        "institution": ar.get("institution", ""),
+                        "account_name": ar.get("account_name", ""),
+                        "quantity": ar.get("quantity"),
+                        "quantity_start": ar.get("quantity_start"),
+                        "quantity_end": ar.get("quantity_end"),
+                        "buy_amount_krw": int(ar.get("buy_amount_krw") or 0),
+                        "sell_amount_krw": int(ar.get("sell_amount_krw") or 0),
                         "delta_krw": ar.get("delta_krw"),
                         "delta_pct": ar.get("delta_pct"),
                         "local_return_pct": ar.get("local_return_pct"),
@@ -87,6 +94,8 @@ def load_compact_attribution_raw(attr_path):
                         "contrib_pp": ar.get("contrib_pp"),
                         "valuation_start_krw": ar.get("valuation_start_krw"),
                         "valuation_end_krw": ar.get("valuation_end_krw"),
+                        "has_period_trade": bool(ar.get("has_period_trade", False)),
+                        "trade_event_note": ar.get("trade_event_note", ""),
                         "is_bfill_estimated": bool(ar.get("is_bfill_estimated", False)),
                     }
                     for aid, ar in p_val.get("by_asset", {}).items()
@@ -118,6 +127,7 @@ def load_compact_attribution_raw(attr_path):
                             "ticker": x.get("ticker"),
                             "delta_krw": x.get("delta_krw"),
                             "delta_pct": x.get("delta_pct"),
+                            **({"trade_event_note": x["trade_event_note"]} if x.get("trade_event_note") else {}),
                         }
                         for x in dmv.get("top_leaders", [])[:2]
                     ],
@@ -128,6 +138,7 @@ def load_compact_attribution_raw(attr_path):
                             "ticker": x.get("ticker"),
                             "delta_krw": x.get("delta_krw"),
                             "delta_pct": x.get("delta_pct"),
+                            **({"trade_event_note": x["trade_event_note"]} if x.get("trade_event_note") else {}),
                         }
                         for x in dmv.get("top_draggers", [])[:2]
                     ],
@@ -1410,6 +1421,21 @@ html_content = r'''<!DOCTYPE html>
       overflow: hidden;
       text-overflow: ellipsis;
     }
+    .attr-trade-badge {
+      font-size: 0.66rem;
+      font-weight: 700;
+      color: #fbbf24;
+      background: rgba(245, 158, 11, 0.16);
+      border: 1px solid rgba(251, 191, 36, 0.36);
+      padding: 1px 6px;
+      border-radius: 999px;
+      white-space: nowrap;
+    }
+    html.light .attr-trade-badge {
+      color: #b45309;
+      background: rgba(245, 158, 11, 0.14);
+      border-color: rgba(217, 119, 6, 0.36);
+    }
     .attr-mover-right {
       text-align: right;
       flex-shrink: 0;
@@ -2396,7 +2422,7 @@ html_content = r'''<!DOCTYPE html>
           <div class="attr-movers-card attr-draggers-card">
             <div class="attr-movers-card-title">
               <span style="color:var(--profit-negative);">📉 하락 주범 Top 5 (Draggers)</span>
-              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrDraggersUnit">일정 보유수량 기준</span>
+              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrDraggersUnit">거래내역 반영 실보유 기준</span>
             </div>
             <div class="attr-movers-list" id="attrDraggersList"></div>
           </div>
@@ -2404,7 +2430,7 @@ html_content = r'''<!DOCTYPE html>
           <div class="attr-movers-card attr-leaders-card">
             <div class="attr-movers-card-title">
               <span style="color:var(--profit-positive);">📈 상승·방어 주역 Top 5 (Leaders)</span>
-              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrLeadersUnit">일정 보유수량 기준</span>
+              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrLeadersUnit">거래내역 반영 실보유 기준</span>
             </div>
             <div class="attr-movers-list" id="attrLeadersList"></div>
           </div>
@@ -3243,11 +3269,14 @@ html_content = r'''<!DOCTYPE html>
         const barW = Math.min(100, Math.max(4, (Math.abs(dKrw) / maxAbs) * 100)).toFixed(1);
         const barCls = dKrw < 0 ? "neg" : "pos";
         const valCls = dKrw < 0 ? "pnl-minus" : (dKrw > 0 ? "pnl-plus" : "");
-        const acctAsset = (typeof activeAssets !== "undefined" && Array.isArray(activeAssets))
-          ? activeAssets.find(x => x.id === item.asset_id)
-          : null;
-        const acctTxt = acctAsset
-          ? `${acctAsset.institution} · ${acctAsset.account_name}`
+        const allKnownAssets = (typeof activeAssets !== "undefined" && Array.isArray(activeAssets) && activeAssets.length > 0)
+          ? activeAssets
+          : ((typeof EMBEDDED_ASSETS_V3 !== "undefined" && Array.isArray(EMBEDDED_ASSETS_V3)) ? EMBEDDED_ASSETS_V3 : []);
+        const acctAsset = allKnownAssets.find(x => x.id === item.asset_id) || null;
+        const itemInst = item.institution || (acctAsset && acctAsset.institution) || "";
+        const itemAcct = item.account_name || (acctAsset && acctAsset.account_name) || "";
+        const acctTxt = (itemInst || itemAcct)
+          ? [itemInst, itemAcct].filter(Boolean).join(" · ")
           : (item.category || "");
         const url = acctAsset && typeof getAssetMarketUrl === "function" ? getAssetMarketUrl(acctAsset) : null;
         const nameDisplay = url
@@ -3265,6 +3294,9 @@ html_content = r'''<!DOCTYPE html>
         }
 
         const subParts = [];
+        if (item.has_period_trade && item.trade_event_note) {
+          subParts.push(`<span class="attr-trade-badge">${escapeAttrHtml(item.trade_event_note)}</span>`);
+        }
         if (item.currency && item.currency !== "KRW" && item.price_delta_krw !== undefined) {
           subParts.push(`<span>${escapeAttrHtml(item.currency)} 시세 ${formatSignedCompactKrw(item.price_delta_krw)} / 환율 ${formatSignedCompactKrw(item.fx_delta_krw || 0)}</span>`);
         }
@@ -3330,12 +3362,13 @@ html_content = r'''<!DOCTYPE html>
       const attrRet = Number(pData.attr_return_pct || 0);
       const attrCls = attrDelta > 0 ? "pos" : (attrDelta < 0 ? "neg" : "");
       const scLabel = (scObj && scObj.label) || ATTR_SCENARIO_LABELS[scKey] || scKey;
+      const evalCount = pData.evaluated_asset_count || (scObj && scObj.asset_count) || 0;
 
       if (metaEl) {
         const metaBadges = [
-          `<span class="attr-meta-badge scenario">${escapeAttrHtml(scLabel)} (${scObj.asset_count || 0}종)</span>`,
+          `<span class="attr-meta-badge scenario">${escapeAttrHtml(scLabel)} (실보유 ${evalCount}종)</span>`,
           `<span class="attr-meta-badge">📅 ${escapeAttrHtml(pData.d_start || "")} → ${escapeAttrHtml(pData.d_end || "")}</span>`,
-          `<span class="attr-meta-badge ${attrCls}">시세 변동 ${formatSignedExactKrw(attrDelta)} (${formatSignedPct(attrRet)})</span>`
+          `<span class="attr-meta-badge ${attrCls}">실보유 변동 ${formatSignedExactKrw(attrDelta)} (${formatSignedPct(attrRet)})</span>`
         ];
         if (pData.is_market_closed_day && pData.fallback_trading_date) {
           metaBadges.push(`<span class="attr-meta-badge">⏸️ 직전 거래일 ${escapeAttrHtml(pData.fallback_trading_date)} 기준</span>`);
@@ -3353,9 +3386,12 @@ html_content = r'''<!DOCTYPE html>
           badges.push(`<span class="attr-meta-badge">⚖️ 순변동 보합 (상승·하락 종목 상쇄)</span>`);
         }
         badges.push(`<span class="attr-meta-badge">시계열 NAV: ${formatSignedCompactKrw(pData.nav_delta_krw)} (${formatSignedPct(pData.period_return_pct)})</span>`);
-        badges.push(`<span class="attr-meta-badge">시세·환율 합계: ${formatSignedCompactKrw(attrDelta)} (가격 ${formatSignedCompactKrw(pData.total_price_delta_krw)} / 환율 ${formatSignedCompactKrw(pData.total_fx_delta_krw)})</span>`);
+        badges.push(`<span class="attr-meta-badge">실보유 합계: ${formatSignedCompactKrw(attrDelta)} (가격 ${formatSignedCompactKrw(pData.total_price_delta_krw)} / 환율 ${formatSignedCompactKrw(pData.total_fx_delta_krw)})</span>`);
+        if (Number(pData.period_buy_krw || 0) > 0 || Number(pData.period_sell_krw || 0) > 0) {
+          badges.push(`<span class="attr-meta-badge">매매 현금흐름: 매수 ${formatUnsignedCompactKrw(pData.period_buy_krw || 0)} / 매도 ${formatUnsignedCompactKrw(pData.period_sell_krw || 0)}</span>`);
+        }
         if (Math.abs(Number(pData.residual_krw || 0)) >= 10000) {
-          badges.push(`<span class="attr-meta-badge">매매·입출금 잔차: ${formatSignedCompactKrw(pData.residual_krw)}</span>`);
+          badges.push(`<span class="attr-meta-badge">현금흐름·스냅샷 차: ${formatSignedCompactKrw(pData.residual_krw)}</span>`);
         }
         summaryEl.innerHTML = `
           <div>${escapeAttrHtml(pData.auto_summary || "원인 요약 정보 없음")}</div>
@@ -3364,16 +3400,17 @@ html_content = r'''<!DOCTYPE html>
       }
 
       if (tradeEl) {
-        const trades = Array.isArray(pData.recent_trades) ? pData.recent_trades : [];
+        const trades = (Array.isArray(pData.recent_trades) ? pData.recent_trades : [])
+          .filter(t => typeof isRpTrade !== "function" || !isRpTrade(t));
         if (trades.length > 0) {
           const showTrades = trades.slice(0, 5);
           const extraCnt = trades.length - showTrades.length;
           const itemsHtml = showTrades.map(t => {
             const typeBadge = t.trade_type === "BUY" ? "매수" : "매도";
-            return `<div class="attr-trade-notice-item">• <strong>${escapeAttrHtml(t.date)}</strong> [${escapeAttrHtml(t.asset_name || t.asset_id || "")}] ${typeBadge} — ${escapeAttrHtml(t.note || "내부 거래로 시세 급등락 주범 오탐에서 제외됨")}</div>`;
-          }).join("") + (extraCnt > 0 ? `<div class="attr-trade-notice-item">• 외 ${extraCnt}건의 매매·이체 내역이 시세 변동 오탐 방지를 위해 제외되었습니다.</div>` : "");
+            return `<div class="attr-trade-notice-item">• <strong>${escapeAttrHtml(t.date)}</strong> [${escapeAttrHtml(t.asset_name || t.asset_id || "")}] ${typeBadge} — ${escapeAttrHtml(t.note || "체결일 기준 실보유 수량·현금흐름 손익 반영")}</div>`;
+          }).join("") + (extraCnt > 0 ? `<div class="attr-trade-notice-item">• 외 ${extraCnt}건의 주식·ETF 매매가 실보유 기준에 반영되었습니다.</div>` : "");
           tradeEl.innerHTML = `
-            <div class="attr-trade-notice-title">ℹ️ 기간 내 내부 이체·RP 롤오버·매매 안내 (${trades.length}건 · 시세 급등락 오탐 제외)</div>
+            <div class="attr-trade-notice-title">ℹ️ 기간 내 매매 이력 (${trades.length}건 · 실보유 수량·체결가 반영됨)</div>
             <div class="attr-trade-notice-list">${itemsHtml}</div>
           `;
           tradeEl.style.display = "block";
@@ -3396,8 +3433,8 @@ html_content = r'''<!DOCTYPE html>
         }
       }
 
-      if (draggersUnitEl) draggersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "일정 보유수량 기준";
-      if (leadersUnitEl) leadersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "일정 보유수량 기준";
+      if (draggersUnitEl) draggersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "거래내역 반영 실보유 기준";
+      if (leadersUnitEl) leadersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "거래내역 반영 실보유 기준";
 
       renderAttrMoversColumn(draggersEl, draggersList, "dragger", fallbackInfo);
       renderAttrMoversColumn(leadersEl, leadersList, "leader", fallbackInfo);
@@ -5513,6 +5550,19 @@ html_content = r'''<!DOCTYPE html>
       renderTradesTable();
     }
 
+    function isRpTrade(t) {
+      if (!t) return false;
+      const ticker = String(t.ticker || "").trim().toUpperCase();
+      const channel = String(t.channel || "").trim();
+      const name = String(t.asset_name || t.name || "").trim();
+      const assetType = String(t.asset_type || "").trim().toUpperCase();
+      if (ticker.startsWith("RP-")) return true;
+      if (channel === "구글시트_RP거래내역") return true;
+      if (/(일반|외화|수시|약정|원화)\s*RP|\bRP\b/i.test(name)) return true;
+      if (["RP", "외화RP", "원화RP"].includes(assetType)) return true;
+      return false;
+    }
+
     function renderTradesTable(tradesList) {
       const tbody = document.getElementById("tradesTableBody");
       const countBadge = document.getElementById("tradesCountBadge");
@@ -5521,11 +5571,11 @@ html_content = r'''<!DOCTYPE html>
 
       const rawList = tradesList || (typeof currentTransactions !== "undefined" && currentTransactions ? currentTransactions : (typeof EMBEDDED_TRANSACTIONS !== "undefined" ? EMBEDDED_TRANSACTIONS : []));
 
-      // status === "APPLIED" 필터링
-      const txList = (rawList || []).filter(t => !t.status || t.status === "APPLIED");
+      // status === "APPLIED" 및 RP 거래 제외 필터링 (v1.1 §5.4)
+      const txList = (rawList || []).filter(t => (!t.status || t.status === "APPLIED") && !isRpTrade(t));
 
       if (!txList || txList.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:32px; color:var(--text-muted); font-size:0.85rem;">최근 기록된 매매내역이 없습니다. (텔레그램 체결 알림 또는 입력 시 자동 반영됩니다.)</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="12" style="text-align:center; padding:32px; color:var(--text-muted); font-size:0.85rem;">최근 주식·ETF 매매 내역이 없습니다 (RP 거래 제외)</td></tr>`;
         if (countBadge) countBadge.innerText = "0건";
         if (btnToggle) btnToggle.style.display = "none";
         return;
@@ -5879,7 +5929,10 @@ html_content = r'''<!DOCTYPE html>
             const fxSub = (a.currency && a.currency !== "KRW" && Math.abs(fxDelta) >= 100)
               ? `<div class="table-sub-meta">환율 ${formatSignedCompactKrw(fxDelta)}</div>`
               : "";
-            const contribSub = `<div class="table-sub-meta">기여 ${formatSignedPct(attrRow.contrib_pp || 0, 2)}p</div>`;
+            const tradeMeta = (attrRow.has_period_trade && attrRow.trade_event_note)
+              ? ` · <span style="color:var(--accent-amber); font-weight:600;">${escapeAttrHtml(attrRow.trade_event_note)}</span>`
+              : "";
+            const contribSub = `<div class="table-sub-meta">기여 ${formatSignedPct(attrRow.contrib_pp || 0, 2)}p${tradeMeta}</div>`;
             profitCellHtml = `${formatSignedExactKrw(dKrw)}${fxSub}`;
             returnCellHtml = `${formatSignedPct(dPct, 2)}${contribSub}`;
           } else {

@@ -2,19 +2,21 @@
 # -*- coding: utf-8 -*-
 """
 src/attribution_engine.py
-계좌 총액 급등·급락 원인 자산 기여도 분석 엔진 (SSoT: docs/attribution_analysis_spec.md)
+계좌 총액 급등·급락 원인 자산 기여도 분석 엔진 (SSoT: docs/attribution_analysis_spec.md v1.1)
 
 핵심 기능:
-1. 활성 자산 61종 판별 및 4대 시나리오(all, no_pension, risk_only, risk_no_pension) 필터
+1. 활성 자산 + 비-RP 매매이력 청산 자산 평가 모수 확장 및 4대 시나리오(all, no_pension, risk_only, risk_no_pension) 필터
 2. 티커/자산유형별 일별 가격·FX 매핑 (DEP-/CASH-/RP- 고정가 vs 시장형 현금 ETF 488770/449170/0048J0/BOXX 구분)
-3. 일정 보유수량(Q_i) 기준 평가변동액·등락률·기여비중(contrib_pct, contrib_pp) 및 Shapley 중간값 가격/환율 분해
+3. 거래내역 기반 일자별 실보유수량 Q_i(d) 타임라인 역산, 현금흐름 보정 손익(ΔV_i), 투입자본 대비 수익률(Δ%_i), 로트 기반 조각별 Shapley 가격/환율 분해
 4. 6대 테마/매크로 팩터 MECE 분류 및 완전 가법성(sum(factor.delta_krw) == attr_delta_krw) 보장
-5. build_period_returns()와 100% 일치하는 9개 기간(1D..1Y, peak_drawdown, trough_gain) + daily_movers + recent_trades
-6. data/ticker_history_cache.json 및 data/attribution_cache.json 원자적 생성·갱신
+5. build_period_returns()와 100% 일치하는 9개 기간(1D..1Y, peak_drawdown, trough_gain) + 실보유 망원합 daily_movers + RP 제외 recent_trades
+6. data/ticker_history_cache.json 및 data/attribution_cache.json (schema_version 1.1) 원자적 생성·갱신
 """
 
+from bisect import bisect_right
 import json
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 
@@ -189,6 +191,83 @@ def is_active_asset(a):
     return (qty > 0) or (val > 0)
 
 
+_RP_NAME_RE = re.compile(r"(일반|외화|수시|약정|원화)\s*RP|\bRP\b", re.IGNORECASE)
+
+
+def is_rp_trade(tx: dict) -> bool:
+    """
+    RP(환매조건부채권: 일반RP·외화RP·수시RP 등) 단기 자금 회전 거래 판별 SSoT 규칙 (명세 §2.5).
+    "ITOCHU CORP", "Microsoft Corp" 등 "CORP" 오탐 방지를 위해 단어 경계 \\bRP\\b 및 한글 RP 유형 접두사만 매칭한다.
+    """
+    if not tx or not isinstance(tx, dict):
+        return False
+    ticker = str(tx.get("ticker") or "").strip().upper()
+    channel = str(tx.get("channel") or "").strip()
+    name = str(tx.get("asset_name") or tx.get("name") or "").strip()
+    asset_type = str(tx.get("asset_type") or "").strip().upper()
+    if ticker.startswith("RP-"):
+        return True
+    if channel == "구글시트_RP거래내역":
+        return True
+    if any(kw in name for kw in ("일반RP", "외화RP", "수시RP", "약정RP", "원화RP")):
+        return True
+    if _RP_NAME_RE.search(name):
+        return True
+    if asset_type in ("RP", "외화RP", "원화RP"):
+        return True
+    return False
+
+
+def _collect_eval_assets(assets, transactions):
+    """
+    명세 §2.1: 현재 활성 보유 자산 + APPLIED 비-RP 시장성 매매 이력이 있는 전량 매도/청산 자산 결합.
+    AST-057/AST-058 등 RP 해지 자산은 영구 배제한다.
+    Returns: (active_assets, sold_eval_assets, eval_assets)
+    """
+    active_assets = [a for a in (assets or []) if is_active_asset(a)]
+    active_ids = {a.get("id") for a in active_assets if a.get("id")}
+    assets_by_id = {a.get("id"): a for a in (assets or []) if a.get("id")}
+
+    sold_eval_assets = []
+    seen_sold_keys = set()
+    for tx in (transactions or []):
+        if tx.get("status") != "APPLIED":
+            continue
+        if is_rp_trade(tx):
+            continue
+        if tx.get("trade_type") not in ("BUY", "SELL"):
+            continue
+        aid = tx.get("asset_id")
+        tkr = (tx.get("ticker") or "").strip()
+        key = aid or tkr
+        if not key or key in active_ids or key in seen_sold_keys:
+            continue
+
+        a = assets_by_id.get(aid) if aid else None
+        if a is None:
+            curr = tx.get("currency") or "KRW"
+            a = {
+                "id": aid or f"TX-SOLD-{tkr}",
+                "name": tx.get("asset_name") or tkr or "청산종목",
+                "ticker": tkr,
+                "category": tx.get("category") or ("해외주식" if curr in ("USD", "JPY") else "국내주식"),
+                "institution": tx.get("institution") or "",
+                "account_name": tx.get("account_name") or "",
+                "currency": curr,
+                "quantity": 0.0,
+                "valuation_krw": 0,
+                "current_price": float(tx.get("price") or 0),
+                "tags": [],
+            }
+        a_tkr = (a.get("ticker") or "").strip()
+        if not a_tkr or a_tkr.startswith(("DEP-", "CASH-", "RP-")):
+            continue
+        seen_sold_keys.add(key)
+        sold_eval_assets.append(a)
+
+    return active_assets, sold_eval_assets, (active_assets + sold_eval_assets)
+
+
 def classify_factor(a):
     """
     6대 테마/매크로 팩터 MECE 분류 (명세 §3.1 우선순위 1 -> 5 엄격 준수).
@@ -331,9 +410,11 @@ def ensure_ticker_history_cache(
     live_market_data=None,
     ticker_cache_file=None,
     allow_network=True,
+    transactions=None,
 ):
     """
     data/ticker_history_cache.json 로드 또는 갱신.
+    - 활성 자산 + 비-RP 매매이력 청산 자산 티커(494310 등) 모두 포함
     - 이미 유효한 최신 캐시가 있고 force_refresh=False면 네트워크 호출 없이 즉시 활용
     - 없거나 강제 갱신 또는 신규 티커/날짜 공백이 있으면 병렬 수집 후 원자적 저장
     - 오프라인/네트워크 장애 시 기존 캐시 및 안전 폴백 반환
@@ -342,11 +423,14 @@ def ensure_ticker_history_cache(
     today_dt = datetime.now(KST).date()
     today_str = today_dt.strftime("%Y-%m-%d")
 
+    if transactions is None:
+        transactions = _load_json_safe(TRANSACTIONS_FILE, [])
+
     existing = load_ticker_history_cache(cache_path)
-    active = [a for a in assets if is_active_asset(a)]
+    _, _, eval_assets = _collect_eval_assets(assets, transactions)
     needed_tickers = sorted({
         (a.get("ticker") or "").strip()
-        for a in active
+        for a in eval_assets
         if (a.get("ticker") or "").strip()
         and not (a.get("ticker") or "").strip().startswith(("DEP-", "CASH-", "RP-"))
     })
@@ -354,20 +438,42 @@ def ensure_ticker_history_cache(
     existing_tickers = existing.get("tickers", {})
     existing_fx = existing.get("fx", {})
     existing_max = (existing.get("date_range") or {}).get("max_date", "")
+    existing_min = (existing.get("date_range") or {}).get("min_date")
+    existing_cov = existing.get("coverage") or {}
     has_all_tickers = all(t in existing_tickers and existing_tickers[t].get("prices") for t in needed_tickers)
     has_fx = ("KRW=X" in existing_fx and existing_fx["KRW=X"].get("prices")) and (
         "JPYKRW=X" in existing_fx and existing_fx["JPYKRW=X"].get("prices")
     )
+    has_v11_cov = (
+        existing_cov.get("total_eval_assets") == len(eval_assets)
+        and existing_cov.get("unique_market_tickers") == len(needed_tickers)
+    )
 
-    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str:
+    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str and has_v11_cov:
         return existing
+
+    # 기존 캐시에 모든 시계열이 있고 강제 갱신이 아니라면 네트워크 없이 스키마/커버리지 업그레이드 가능
+    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str and not has_v11_cov:
+        try:
+            return save_ticker_history_cache(
+                {},
+                assets=assets,
+                cache_file=cache_path,
+                min_date=existing_min,
+                max_date=max(today_str, existing_max),
+                live_market_data=live_market_data,
+                transactions=transactions,
+            )
+        except Exception as e:
+            print(f"[AttributionEngine] ticker_history_cache upgrade error: {e}")
+            return existing
 
     # 네트워크 수집 시도 (가능한 경우)
     fetched = {}
     if allow_network:
         dom_set = set(DOMESTIC_TICKERS)
         for_set = set(FOREIGN_TICKERS)
-        for a in active:
+        for a in eval_assets:
             t = (a.get("ticker") or "").strip()
             if not t or t.startswith(("DEP-", "CASH-", "RP-")) or t == "GOLD-KRX":
                 continue
@@ -383,14 +489,16 @@ def ensure_ticker_history_cache(
             fetched = {}
 
     has_any_fetched = any(bool(v) for v in fetched.values())
-    if has_any_fetched or not existing:
+    if has_any_fetched or not existing or (has_all_tickers and has_fx and not has_v11_cov):
         try:
             return save_ticker_history_cache(
                 fetched,
                 assets=assets,
                 cache_file=cache_path,
-                max_date=today_str,
+                min_date=existing_min if not has_any_fetched else None,
+                max_date=max(today_str, existing_max) if (not has_any_fetched and existing_max) else today_str,
                 live_market_data=live_market_data,
+                transactions=transactions,
             )
         except Exception as e:
             print(f"[AttributionEngine] save_ticker_history_cache error: {e}")
@@ -470,9 +578,9 @@ def _resolve_period_start_dates(nav_dict):
     return d_end, start_map
 
 
-def _prepare_asset_valuator(assets, ticker_cache, live_market_data, min_date, max_date):
+def _prepare_asset_valuator(eval_assets, ticker_cache, live_market_data, min_date, max_date):
     """
-    활성 자산 61종 각각의 유형 분류 및 일별 가격/FX 평가 함수 준비
+    평가 모수(활성 자산 + 비-RP 매도 이력 자산) 각각의 유형 분류 및 일별 가격/FX 평가 함수 준비
     """
     today_dt = date.fromisoformat(max_date)
     is_weekend = (today_dt.weekday() >= 5)
@@ -520,9 +628,7 @@ def _prepare_asset_valuator(assets, ticker_cache, live_market_data, min_date, ma
             }
 
     asset_specs = []
-    for a in assets:
-        if not is_active_asset(a):
-            continue
+    for a in eval_assets:
         t = (a.get("ticker") or "").strip()
         curr = a.get("currency") or "KRW"
         qty = float(a.get("quantity") or 0)
@@ -570,6 +676,8 @@ def _prepare_asset_valuator(assets, ticker_cache, live_market_data, min_date, ma
             "name": a.get("name", ""),
             "ticker": t,
             "category": a.get("category", ""),
+            "institution": a.get("institution", ""),
+            "account_name": a.get("account_name", ""),
             "currency": curr,
             "quantity": qty,
             "valuation_ledger": val_ledger,
@@ -578,43 +686,253 @@ def _prepare_asset_valuator(assets, ticker_cache, live_market_data, min_date, ma
             "price_source": psrc,
             "factor_id": factor_id,
             "first_real_date": (ticker_meta.get(t) or {}).get("first_real_date"),
+            "is_active_holding": is_active_asset(a),
         })
 
-    def evaluate_on_date(spec, d_str):
+    def evaluate_on_date(spec, d_str, qty_override=None):
         atype = spec["asset_type_code"]
         t = spec["ticker"]
         curr = spec["currency"]
-        qty = spec["quantity"]
+        qty = spec["quantity"] if qty_override is None else float(qty_override)
 
-        if atype in ("KRW_FIXED_CASH", "UNMAPPED_FALLBACK"):
+        if atype == "KRW_FIXED_CASH":
             px = spec["current_price_ledger"]
             fx = 1.0
-            val_krw = spec["valuation_ledger"]
+            val_krw = spec["valuation_ledger"] if qty > 0 else 0
+        elif atype == "UNMAPPED_FALLBACK":
+            px = spec["current_price_ledger"]
+            if curr in ("USD", "JPY"):
+                fx_k = "KRW=X" if curr == "USD" else "JPYKRW=X"
+                fx_def = 1336.2 if curr == "USD" else 8.343
+                fx = _lookup_series_price(fx_lookups.get(fx_k), d_str, fx_def)
+            else:
+                fx = 1.0
+            if qty <= 0:
+                val_krw = 0
+            elif abs(qty - spec["quantity"]) < 1e-9:
+                val_krw = spec["valuation_ledger"]
+            else:
+                val_krw = int(round(qty * px * fx))
         elif atype == "FX_FIXED_CASH":
             px = 1.0
             fx_k = "KRW=X" if curr == "USD" else "JPYKRW=X"
             fx_def = 1336.2 if curr == "USD" else 8.343
             fx = _lookup_series_price(fx_lookups.get(fx_k), d_str, fx_def)
-            val_krw = int(round(qty * 1.0 * fx))
+            val_krw = 0 if qty <= 0 else int(round(qty * 1.0 * fx))
         elif atype in ("KR_EQUITY_ETF", "GOLD_KRX"):
             px = _lookup_series_price(ticker_lookups.get(t), d_str, spec["current_price_ledger"])
             fx = 1.0
-            val_krw = int(round(qty * px))
+            val_krw = 0 if qty <= 0 else int(round(qty * px))
         else:  # US_EQUITY_ETF, JP_EQUITY_ETF
             px = _lookup_series_price(ticker_lookups.get(t), d_str, spec["current_price_ledger"])
             fx_k = "KRW=X" if curr == "USD" else "JPYKRW=X"
             fx_def = 1336.2 if curr == "USD" else 8.343
             fx = _lookup_series_price(fx_lookups.get(fx_k), d_str, fx_def)
-            val_krw = int(round(qty * px * fx))
+            val_krw = 0 if qty <= 0 else int(round(qty * px * fx))
 
         return px, fx, val_krw
 
-    return asset_specs, evaluate_on_date
+    return asset_specs, evaluate_on_date, fx_lookups
+
+
+def _format_trade_event_note(txs):
+    """명세 §2.3(7): 기간 내 매매 배지 문구 생성"""
+    if not txs:
+        return ""
+    if len(txs) == 1:
+        tx = txs[0]
+        txd = tx["tx_date"]
+        mmdd = f"{txd[5:7]}/{txd[8:10]}"
+        q = float(tx.get("quantity") or 0)
+        q_str = f"{int(round(q))}주" if abs(q - round(q)) < 1e-6 else f"{q:g}주"
+        ttype = tx.get("trade_type", "")
+        if ttype == "SELL":
+            action = "전량매도" if float(tx.get("new_qty") or 0) <= 1e-9 else "일부매도"
+        else:
+            action = "신규매수" if float(tx.get("prev_qty") or 0) <= 1e-9 else "추가매수"
+        return f"{mmdd} {q_str} {action} 반영"
+    last_tx = txs[-1]
+    txd = last_tx["tx_date"]
+    mmdd = f"{txd[5:7]}/{txd[8:10]}"
+    return f"{mmdd} 외 {len(txs) - 1}건 매매 반영"
+
+
+def _build_asset_tx_timelines(asset_specs, transactions, fx_lookups):
+    """
+    명세 §2.3(1)~(2): 비-RP 시장성 매매 이력 기반 자산별 일자별 마감 실보유수량 Q_i(d) 및 구간 거래 조회기 구축
+    """
+    specs_by_id = {s["asset_id"]: s for s in asset_specs if s.get("asset_id")}
+    tx_by_asset = {s["asset_id"]: [] for s in asset_specs if s.get("asset_id")}
+
+    for tx in (transactions or []):
+        if tx.get("status") != "APPLIED":
+            continue
+        if is_rp_trade(tx):
+            continue
+        ttype = tx.get("trade_type", "")
+        if ttype not in ("BUY", "SELL"):
+            continue
+        tkr = (tx.get("ticker") or "").strip()
+        raw_aid = tx.get("asset_id")
+        target_aid = raw_aid if raw_aid in specs_by_id else f"TX-SOLD-{tkr}"
+        spec = specs_by_id.get(target_aid)
+        if not spec:
+            continue
+        if spec["asset_type_code"] in ("KRW_FIXED_CASH", "FX_FIXED_CASH"):
+            continue
+        tx_tkr = spec["ticker"]
+        if not tx_tkr or tx_tkr.startswith(("DEP-", "CASH-", "RP-")):
+            continue
+
+        ts = str(tx.get("timestamp") or tx.get("date") or "")
+        tx_date = ts[:10]
+        if len(tx_date) != 10:
+            continue
+        qty = float(tx.get("quantity") or 0)
+        if qty <= 0:
+            continue
+
+        curr = spec["currency"]
+        raw_px = float(tx.get("price") or 0)
+        raw_amt_local = float(tx.get("total_amount") or 0)
+        raw_amt_krw = float(tx.get("total_amount_krw") or 0)
+
+        tx_amount_local = raw_amt_local if raw_amt_local > 0 else (qty * raw_px if raw_px > 0 else 0.0)
+        if curr == "KRW":
+            tx_fx = 1.0
+            if tx_amount_local <= 0 and raw_amt_krw > 0:
+                tx_amount_local = raw_amt_krw
+        else:
+            if raw_amt_krw > 0 and tx_amount_local > 0:
+                tx_fx = raw_amt_krw / tx_amount_local
+            elif float(tx.get("exchange_rate") or 0) > 0:
+                tx_fx = float(tx["exchange_rate"])
+                if curr == "JPY" and tx_fx > 100:
+                    tx_fx = tx_fx / 100.0
+            else:
+                fx_k = "KRW=X" if curr == "USD" else "JPYKRW=X"
+                fx_def = 1336.2 if curr == "USD" else 8.343
+                tx_fx = _lookup_series_price(fx_lookups.get(fx_k), tx_date, fx_def)
+            if tx_amount_local <= 0 and raw_amt_krw > 0 and tx_fx > 0:
+                tx_amount_local = raw_amt_krw / tx_fx
+
+        tx_amount_krw = int(round(raw_amt_krw)) if raw_amt_krw > 0 else int(round(tx_amount_local * tx_fx))
+        tx_price_local = raw_px if raw_px > 0 else (tx_amount_local / qty if qty > 0 else 0.0)
+
+        tx_by_asset[target_aid].append({
+            "tx_id": tx.get("tx_id") or "",
+            "timestamp": ts,
+            "tx_date": tx_date,
+            "asset_id": target_aid,
+            "asset_name": tx.get("asset_name") or spec["name"],
+            "ticker": spec["ticker"],
+            "trade_type": ttype,
+            "quantity": qty,
+            "prev_qty": float(tx["prev_qty"]) if tx.get("prev_qty") is not None else None,
+            "new_qty": float(tx["new_qty"]) if tx.get("new_qty") is not None else None,
+            "tx_amount_local": tx_amount_local,
+            "tx_amount_krw": tx_amount_krw,
+            "tx_fx": tx_fx,
+            "tx_price_local": tx_price_local,
+            "realized_profit_krw": (
+                int(round(float(tx["realized_profit_krw"])))
+                if tx.get("realized_profit_krw") is not None
+                else None
+            ),
+        })
+
+    dates_by_asset = {}
+    for aid, tx_list in tx_by_asset.items():
+        if not tx_list:
+            dates_by_asset[aid] = []
+            continue
+        tx_list.sort(key=lambda item: (item["tx_date"], item["timestamp"], str(item["tx_id"])))
+        if any(item["prev_qty"] is None or item["new_qty"] is None for item in tx_list):
+            cur_qty = float(specs_by_id[aid]["quantity"])
+            for item in reversed(tx_list):
+                item_new = cur_qty if item["new_qty"] is None else float(item["new_qty"])
+                if item["prev_qty"] is None:
+                    if item["trade_type"] == "BUY":
+                        item_prev = item_new - item["quantity"]
+                    else:
+                        item_prev = item_new + item["quantity"]
+                    item_prev = max(0.0, round(item_prev, 8))
+                else:
+                    item_prev = float(item["prev_qty"])
+                item["new_qty"] = item_new
+                item["prev_qty"] = item_prev
+                cur_qty = item_prev
+        dates_by_asset[aid] = [item["tx_date"] for item in tx_list]
+
+    def get_qty_on_date(aid, d_str):
+        tx_list = tx_by_asset.get(aid)
+        if not tx_list:
+            spec = specs_by_id.get(aid)
+            return float(spec["quantity"]) if spec else 0.0
+        d_arr = dates_by_asset[aid]
+        idx = bisect_right(d_arr, d_str)
+        if idx == 0:
+            return float(tx_list[0]["prev_qty"])
+        return float(tx_list[idx - 1]["new_qty"])
+
+    def get_trades_in_range(aid, d_start, d_end):
+        tx_list = tx_by_asset.get(aid)
+        if not tx_list:
+            return []
+        d_arr = dates_by_asset[aid]
+        lo = bisect_right(d_arr, d_start)
+        hi = bisect_right(d_arr, d_end)
+        return tx_list[lo:hi]
+
+    return {
+        "tx_by_asset": tx_by_asset,
+        "get_qty_on_date": get_qty_on_date,
+        "get_trades_in_range": get_trades_in_range,
+    }
+
+
+def _compute_fx_price_split_fifo(atype, q0, p0, fx0, p1, fx1, delta_krw, period_txs):
+    """
+    명세 §2.3(6): 로트 기반 조각별(Piecewise) FIFO Shapley 가격/환율 효과 분해 (0원 오차 보장)
+    """
+    if atype in ("KRW_FIXED_CASH", "UNMAPPED_FALLBACK", "KR_EQUITY_ETF", "GOLD_KRX"):
+        return delta_krw, 0
+    if atype == "FX_FIXED_CASH":
+        return 0, delta_krw
+
+    lots = [{"qty": q0, "p": p0, "fx": fx0}] if q0 > 1e-9 else []
+    raw_fx_sum = 0.0
+
+    for tx in (period_txs or []):
+        qty_k = float(tx["quantity"])
+        px_k = float(tx["tx_price_local"])
+        fx_k = float(tx["tx_fx"])
+        if tx["trade_type"] == "BUY":
+            lots.append({"qty": qty_k, "p": px_k, "fx": fx_k})
+        else:
+            rem = qty_k
+            while rem > 1e-9 and lots:
+                lot = lots[0]
+                take = min(rem, lot["qty"])
+                raw_fx_sum += take * ((lot["p"] + px_k) / 2.0) * (fx_k - lot["fx"])
+                lot["qty"] -= take
+                rem -= take
+                if lot["qty"] <= 1e-9:
+                    lots.pop(0)
+
+    for lot in lots:
+        if lot["qty"] > 1e-9:
+            raw_fx_sum += lot["qty"] * ((lot["p"] + p1) / 2.0) * (fx1 - lot["fx"])
+
+    fx_delta_krw = int(round(raw_fx_sum))
+    price_delta_krw = delta_krw - fx_delta_krw
+    return price_delta_krw, fx_delta_krw
 
 
 def _compute_period_attribution(
     spec_list,
     evaluate_on_date,
+    tx_timeline,
     d_start,
     d_end,
     period_key,
@@ -624,61 +942,90 @@ def _compute_period_attribution(
     recent_trades,
     fallback_trading_date,
 ):
-    """단일 시나리오 × 단일 기간의 자산별/팩터별 기여도 산출"""
+    """단일 시나리오 × 단일 기간의 거래내역 실보유 기준 자산별/팩터별 기여도 산출"""
     raw_items = []
     attr_start_krw = 0
     attr_end_krw = 0
+    period_buy_krw = 0
+    period_sell_krw = 0
     total_price_delta_krw = 0
     total_fx_delta_krw = 0
 
+    get_qty_on_date = tx_timeline["get_qty_on_date"]
+    get_trades_in_range = tx_timeline["get_trades_in_range"]
+
     for spec in spec_list:
-        p0, fx0, v0 = evaluate_on_date(spec, d_start)
-        p1, fx1, v1 = evaluate_on_date(spec, d_end)
-        delta_krw = v1 - v0
+        aid = spec["asset_id"]
+        q0 = get_qty_on_date(aid, d_start)
+        q1 = get_qty_on_date(aid, d_end)
+        period_txs = get_trades_in_range(aid, d_start, d_end)
+
+        # 명세 §2.1: 기간 내 보유(시작/종료) 또는 비-RP 거래 발생 자산만 편입
+        if q0 <= 1e-9 and q1 <= 1e-9 and not period_txs:
+            continue
+
+        p0, fx0, v0 = evaluate_on_date(spec, d_start, qty_override=q0)
+        p1, fx1, v1 = evaluate_on_date(spec, d_end, qty_override=q1)
+
+        buy_krw = sum(t["tx_amount_krw"] for t in period_txs if t["trade_type"] == "BUY")
+        sell_krw = sum(t["tx_amount_krw"] for t in period_txs if t["trade_type"] == "SELL")
+        buy_local = sum(t["tx_amount_local"] for t in period_txs if t["trade_type"] == "BUY")
+        sell_local = sum(t["tx_amount_local"] for t in period_txs if t["trade_type"] == "SELL")
+
+        delta_krw = v1 - v0 + sell_krw - buy_krw
+        basis_krw = v0 + buy_krw
+
         atype = spec["asset_type_code"]
-        qty = spec["quantity"]
+        price_delta_krw, fx_delta_krw = _compute_fx_price_split_fifo(
+            atype, q0, p0, fx0, p1, fx1, delta_krw, period_txs
+        )
 
-        if atype in ("KRW_FIXED_CASH", "UNMAPPED_FALLBACK", "KR_EQUITY_ETF", "GOLD_KRX"):
-            fx_delta_krw = 0
-            price_delta_krw = delta_krw
-        elif atype == "FX_FIXED_CASH":
-            price_delta_krw = 0
-            fx_delta_krw = delta_krw
-        else:
-            raw_fx = qty * ((p0 + p1) / 2.0) * (fx1 - fx0)
-            fx_delta_krw = int(round(raw_fx))
-            price_delta_krw = delta_krw - fx_delta_krw
+        delta_pct = round((delta_krw / basis_krw) * 100, 2) if basis_krw > 0 else 0.0
+        local_start = q0 * p0
+        local_end = q1 * p1
+        local_delta = local_end - local_start + sell_local - buy_local
+        local_basis = local_start + buy_local
+        local_return_pct = round((local_delta / local_basis) * 100, 2) if local_basis > 0 else 0.0
 
-        delta_pct = round((delta_krw / v0) * 100, 2) if v0 > 0 else 0.0
-        local_return_pct = round(((p1 - p0) / p0) * 100, 2) if p0 > 0 else 0.0
         first_real = spec.get("first_real_date")
         is_bfill = (
             atype == "UNMAPPED_FALLBACK"
             or bool(first_real and d_start < first_real and atype not in ("KRW_FIXED_CASH", "FX_FIXED_CASH"))
         )
 
+        has_period_trade = len(period_txs) > 0
+        trade_event_note = _format_trade_event_note(period_txs)
+
         attr_start_krw += v0
         attr_end_krw += v1
+        period_buy_krw += buy_krw
+        period_sell_krw += sell_krw
         total_price_delta_krw += price_delta_krw
         total_fx_delta_krw += fx_delta_krw
 
         fid = spec["factor_id"]
         raw_items.append({
-            "asset_id": spec["asset_id"],
+            "asset_id": aid,
             "name": spec["name"],
             "ticker": spec["ticker"],
             "category": spec["category"],
+            "institution": spec.get("institution", ""),
+            "account_name": spec.get("account_name", ""),
             "currency": spec["currency"],
             "asset_type_code": atype,
             "factor_id": fid,
             "factor_label": FACTOR_META[fid]["label"],
-            "quantity": qty,
+            "quantity": round(q1, 8),
+            "quantity_start": round(q0, 8),
+            "quantity_end": round(q1, 8),
             "price_start": round(p0, 4),
             "price_end": round(p1, 4),
             "fx_start": round(fx0, 4),
             "fx_end": round(fx1, 4),
             "valuation_start_krw": v0,
             "valuation_end_krw": v1,
+            "buy_amount_krw": buy_krw,
+            "sell_amount_krw": sell_krw,
             "delta_krw": delta_krw,
             "delta_pct": delta_pct,
             "local_return_pct": local_return_pct,
@@ -686,23 +1033,28 @@ def _compute_period_attribution(
             "fx_delta_krw": fx_delta_krw,
             "contrib_pct": 0.0,
             "contrib_pp": 0.0,
+            "has_period_trade": has_period_trade,
+            "trade_event_note": trade_event_note,
             "price_source": spec["price_source"],
             "is_bfill_estimated": is_bfill,
         })
 
-    attr_delta_krw = attr_end_krw - attr_start_krw
-    attr_return_pct = round((attr_delta_krw / attr_start_krw) * 100, 2) if attr_start_krw > 0 else 0.0
+    trade_cashflow_net_krw = period_sell_krw - period_buy_krw
+    capital_basis_krw = attr_start_krw + period_buy_krw
+    attr_delta_krw = (attr_end_krw - attr_start_krw) + trade_cashflow_net_krw
+    attr_return_pct = round((attr_delta_krw / capital_basis_krw) * 100, 2) if capital_basis_krw > 0 else 0.0
     nav_delta_krw = nav_end_hybrid - nav_start_hybrid
     residual_krw = nav_delta_krw - attr_delta_krw
     abs_attr_delta = abs(attr_delta_krw)
-    is_near_flat_net = abs_attr_delta < max(100_000, 0.0005 * attr_start_krw)
-    is_market_closed_day = (abs_attr_delta == 0)
+    is_near_flat_net = abs_attr_delta < max(100_000, 0.0005 * capital_basis_krw)
+    has_any_item_delta = any(x["delta_krw"] != 0 for x in raw_items)
+    is_market_closed_day = (abs_attr_delta == 0 and not has_any_item_delta and not recent_trades)
 
     by_asset = {}
     for item in raw_items:
         dk = item["delta_krw"]
         item["contrib_pct"] = round((dk / abs_attr_delta) * 100, 2) if abs_attr_delta > 0 else 0.0
-        item["contrib_pp"] = round((dk / attr_start_krw) * 100, 2) if attr_start_krw > 0 else 0.0
+        item["contrib_pp"] = round((dk / capital_basis_krw) * 100, 2) if capital_basis_krw > 0 else 0.0
         by_asset[item["asset_id"]] = item
 
     top_draggers = sorted(
@@ -753,7 +1105,7 @@ def _compute_period_attribution(
     for fid, fobj in factor_acc.items():
         dk = fobj["delta_krw"]
         fobj["contrib_pct"] = round((dk / abs_attr_delta) * 100, 2) if abs_attr_delta > 0 else 0.0
-        fobj["contrib_pp"] = round((dk / attr_start_krw) * 100, 2) if attr_start_krw > 0 else 0.0
+        fobj["contrib_pp"] = round((dk / capital_basis_krw) * 100, 2) if capital_basis_krw > 0 else 0.0
 
     factors_list = sorted(
         factor_acc.values(),
@@ -772,7 +1124,7 @@ def _compute_period_attribution(
             f"(직전 거래일: {fallback_trading_date or d_end}, {fb_mmdd} 마감 기준)"
         )
     else:
-        direction = "상승" if attr_delta_krw > 0 else "하락"
+        direction = "상승" if attr_delta_krw > 0 else ("하락" if attr_delta_krw < 0 else "보합")
         drivers = top_leaders[:3] if attr_delta_krw >= 0 else top_draggers[:3]
         if not drivers:
             drivers = (top_leaders[:2] + top_draggers[:2])[:3]
@@ -788,16 +1140,34 @@ def _compute_period_attribution(
                 )
         drivers_joined = "·".join(driver_strs)
         verb = "견인했습니다" if attr_delta_krw >= 0 else "하락을 주도했습니다"
-        auto_summary = (
-            f"{label}({s_mmdd}~{e_mmdd}) 보유 포트폴리오는 {_format_krw_compact(attr_delta_krw, signed=True)}"
-            f"({attr_return_pct:+.2f}%) {direction}했으며, {drivers_joined} 등이 {verb}."
-        )
+        trade_note_suffix = ""
+        traded_items = [x for x in raw_items if x["has_period_trade"]]
+        if traded_items:
+            first_ti = traded_items[0]
+            clean_ti_name = re.sub(r"\s*\([^)]*\).*", "", first_ti["name"]).strip() or first_ti["name"]
+            ti_pnl = _format_krw_compact(first_ti["delta_krw"], signed=True)
+            if len(traded_items) == 1:
+                ti_badge = first_ti["trade_event_note"].replace(" 반영", "")
+                trade_note_suffix = f" ({ti_badge[:5]} {clean_ti_name} {ti_badge[6:]} {ti_pnl} 반영)"
+            else:
+                trade_note_suffix = f" ({clean_ti_name} 등 {len(traded_items)}종 기간 내 매매 실보유 반영)"
+        if drivers_joined:
+            auto_summary = (
+                f"{label}({s_mmdd}~{e_mmdd}) 실보유 기준 포트폴리오는 {_format_krw_compact(attr_delta_krw, signed=True)}"
+                f"({attr_return_pct:+.2f}%) {direction}했으며, {drivers_joined} 등이 {verb}.{trade_note_suffix}"
+            )
+        else:
+            auto_summary = (
+                f"{label}({s_mmdd}~{e_mmdd}) 실보유 기준 포트폴리오는 {_format_krw_compact(attr_delta_krw, signed=True)}"
+                f"({attr_return_pct:+.2f}%) {direction}했습니다.{trade_note_suffix}"
+            )
 
     return {
         "period": period_key,
         "label": label,
         "d_start": d_start,
         "d_end": d_end,
+        "evaluated_asset_count": len(raw_items),
         "is_market_closed_day": is_market_closed_day,
         "fallback_trading_date": fallback_trading_date,
         "nav_start_hybrid": nav_start_hybrid,
@@ -806,6 +1176,10 @@ def _compute_period_attribution(
         "period_return_pct": period_return_pct,
         "attr_start_krw": attr_start_krw,
         "attr_end_krw": attr_end_krw,
+        "period_buy_krw": period_buy_krw,
+        "period_sell_krw": period_sell_krw,
+        "trade_cashflow_net_krw": trade_cashflow_net_krw,
+        "capital_basis_krw": capital_basis_krw,
         "attr_delta_krw": attr_delta_krw,
         "attr_return_pct": attr_return_pct,
         "residual_krw": residual_krw,
@@ -821,59 +1195,65 @@ def _compute_period_attribution(
     }
 
 
-def _extract_recent_trades(transactions, d_start, d_end):
+def _extract_recent_trades(transactions, d_start, d_end, allowed_asset_ids=None):
     """
-    명세 §2.4 방어층 3: 기간 내 APPLIED 거래 스캔 및 내부 이체·RP 롤오버 자동 판정
+    명세 §2.5 / §4.3: 반개구간 (d_start, d_end] 내 APPLIED 비-RP 실제 주식/ETF 매매만 반환
     """
-    applied = [
-        tx for tx in (transactions or [])
-        if tx.get("status") == "APPLIED" and (tx.get("timestamp") or "")[:10]
-    ]
-    date_types = {}
-    for tx in applied:
-        txd = tx["timestamp"][:10]
-        date_types.setdefault(txd, set()).add(tx.get("trade_type", ""))
-
     results = []
-    for tx in applied:
-        txd = tx["timestamp"][:10]
-        if not (d_start <= txd <= d_end):
+    for tx in (transactions or []):
+        if tx.get("status") != "APPLIED":
             continue
-        tkr = (tx.get("ticker") or "").strip()
+        if is_rp_trade(tx):
+            continue
         ttype = tx.get("trade_type", "")
-        types_on_date = date_types.get(txd, set())
-        is_rollover = (
-            ("SELL" in types_on_date and "BUY" in types_on_date)
-            or tkr.startswith(("RP-", "CASH-"))
-            or (ttype == "SELL" and bool(tx.get("cash_adjusted")))
-        )
+        if ttype not in ("BUY", "SELL"):
+            continue
+        txd = (tx.get("timestamp") or tx.get("date") or "")[:10]
+        if len(txd) != 10 or not (d_start < txd <= d_end):
+            continue
 
-        aname = tx.get("asset_name", tkr or "자산")
-        if tkr.startswith("RP-") and ttype == "SELL":
-            note = "만기 해지 ➔ 수시 RP 롤오버 (내부 자금 이동으로 시세 급등락 제외)"
-        elif tkr.startswith("RP-") and ttype == "BUY":
-            note = "만기 RP 해지 자금 수시 RP 재매수 (내부 롤오버로 시세 급등 제외)"
-        elif ttype == "SELL" and tx.get("cash_adjusted"):
-            rp = tx.get("realized_profit_krw")
-            rp_txt = f", 실현손익 {_format_krw_compact(rp, signed=True)}" if rp is not None else ""
-            note = f"전량/일부 매도{_format_krw_compact(tx.get('total_amount_krw', 0))} 완료{rp_txt} ➔ 예수금 입금 (현재 보유 기준 기여도에서 제외)"
-        elif is_rollover:
-            note = "포트폴리오 내부 자금 이동 (기여도 오탐 방지 적용)"
+        tkr = (tx.get("ticker") or "").strip()
+        if tkr.startswith(("DEP-", "CASH-", "RP-")):
+            continue
+        raw_aid = tx.get("asset_id")
+        target_aid = raw_aid if (allowed_asset_ids is None or raw_aid in allowed_asset_ids) else f"TX-SOLD-{tkr}"
+        if allowed_asset_ids is not None and target_aid not in allowed_asset_ids:
+            continue
+
+        aname = tx.get("asset_name") or tkr or "자산"
+        q = float(tx.get("quantity") or 0)
+        q_str = f"{int(round(q))}주" if abs(q - round(q)) < 1e-6 else f"{q:g}주"
+        amt_krw = int(round(float(tx.get("total_amount_krw") or tx.get("total_amount") or 0)))
+        amt_str = f"₩{amt_krw:,}"
+        mmdd = f"{txd[5:7]}/{txd[8:10]}"
+
+        if ttype == "SELL":
+            new_q = float(tx["new_qty"]) if tx.get("new_qty") is not None else 0.0
+            if new_q <= 1e-9:
+                note = f"{mmdd} {q_str} 전량매도({amt_str}) — 실보유 구간 손익 반영, 매도 이후 등락 제외"
+            else:
+                note = f"{mmdd} {q_str} 일부매도({amt_str}) — 잔여 수량·매도 대금 실보유 반영"
         else:
-            note = f"{ttype} 체결 ({_format_krw_compact(tx.get('total_amount_krw', 0))})"
+            prev_q = float(tx["prev_qty"]) if tx.get("prev_qty") is not None else 0.0
+            if prev_q <= 1e-9:
+                note = f"{mmdd} {q_str} 신규매수({amt_str}) — 매수일 이후 실보유 손익 반영"
+            else:
+                note = f"{mmdd} {q_str} 추가매수({amt_str}) — 가중 보유수량 실보유 반영"
 
+        rp_val = tx.get("realized_profit_krw")
         results.append({
             "tx_id": tx.get("tx_id"),
             "date": txd,
-            "asset_id": tx.get("asset_id"),
+            "asset_id": target_aid,
             "asset_name": aname,
             "ticker": tkr,
             "trade_type": ttype,
-            "quantity": tx.get("quantity"),
+            "quantity": q,
+            "price": round(float(tx.get("price") or 0), 4),
             "total_amount": tx.get("total_amount"),
-            "total_amount_krw": int(round(float(tx.get("total_amount_krw") or 0))),
-            "realized_profit_krw": int(round(float(tx.get("realized_profit_krw") or 0))),
-            "is_internal_rollover": is_rollover,
+            "total_amount_krw": amt_krw,
+            "realized_profit_krw": int(round(float(rp_val))) if rp_val is not None else None,
+            "is_internal_rollover": False,
             "note": note,
         })
 
@@ -881,22 +1261,22 @@ def _extract_recent_trades(transactions, d_start, d_end):
     return results
 
 
-def _compute_daily_movers(spec_list, evaluate_on_date, dates):
+def _compute_daily_movers(spec_list, evaluate_on_date, tx_timeline, dates):
     """
-    모든 시계열 날짜 d에 대해 직전일(prev_date) 대비 당일 상승/하락 Top Movers 산출
+    명세 §2.4: 모든 시계열 날짜 d에 대해 실보유 체결가 기준 1일 구간 (prev_d, d] Top Movers 산출
     """
     daily_movers = {}
     prev_vals = {}
-    prev_total = 0
+    get_qty_on_date = tx_timeline["get_qty_on_date"]
+    get_trades_in_range = tx_timeline["get_trades_in_range"]
 
     for idx, d in enumerate(dates):
         cur_vals = {}
-        cur_total = 0
         for spec in spec_list:
-            _, _, v = evaluate_on_date(spec, d)
             aid = spec["asset_id"]
+            q_cur = get_qty_on_date(aid, d)
+            _, _, v = evaluate_on_date(spec, d, qty_override=q_cur)
             cur_vals[aid] = v
-            cur_total += v
 
         if idx == 0:
             daily_movers[d] = {
@@ -911,25 +1291,37 @@ def _compute_daily_movers(spec_list, evaluate_on_date, dates):
             }
         else:
             prev_d = dates[idx - 1]
-            day_delta_krw = cur_total - prev_total
-            day_return_pct = round((day_delta_krw / prev_total) * 100, 2) if prev_total > 0 else 0.0
-
+            day_delta_krw = 0
+            day_basis_krw = 0
             movers = []
+
             for spec in spec_list:
                 aid = spec["asset_id"]
                 v0 = prev_vals[aid]
                 v1 = cur_vals[aid]
-                dk = v1 - v0
+                day_txs = get_trades_in_range(aid, prev_d, d)
+                buy_krw = sum(t["tx_amount_krw"] for t in day_txs if t["trade_type"] == "BUY")
+                sell_krw = sum(t["tx_amount_krw"] for t in day_txs if t["trade_type"] == "SELL")
+
+                dk = v1 - v0 + sell_krw - buy_krw
+                basis = v0 + buy_krw
+                day_delta_krw += dk
+                day_basis_krw += basis
+
                 if dk != 0:
-                    dpct = round((dk / v0) * 100, 2) if v0 > 0 else 0.0
-                    movers.append({
+                    dpct = round((dk / basis) * 100, 2) if basis > 0 else 0.0
+                    m_obj = {
                         "asset_id": aid,
                         "name": spec["name"],
                         "ticker": spec["ticker"],
                         "delta_krw": dk,
                         "delta_pct": dpct,
-                    })
+                    }
+                    if day_txs:
+                        m_obj["trade_event_note"] = _format_trade_event_note(day_txs)
+                    movers.append(m_obj)
 
+            day_return_pct = round((day_delta_krw / day_basis_krw) * 100, 2) if day_basis_krw > 0 else 0.0
             leaders = sorted(
                 [m for m in movers if m["delta_krw"] > 0],
                 key=lambda m: (-m["delta_krw"], m["asset_id"]),
@@ -939,7 +1331,7 @@ def _compute_daily_movers(spec_list, evaluate_on_date, dates):
                 key=lambda m: (m["delta_krw"], m["asset_id"]),
             )[:5]
 
-            is_flat = (len(leaders) == 0 and len(draggers) == 0)
+            is_flat = (day_delta_krw == 0 and len(movers) == 0)
             entry = {
                 "date": d,
                 "prev_date": prev_d,
@@ -954,7 +1346,6 @@ def _compute_daily_movers(spec_list, evaluate_on_date, dates):
             daily_movers[d] = entry
 
         prev_vals = cur_vals
-        prev_total = cur_total
 
     return daily_movers
 
@@ -973,7 +1364,7 @@ def build_attribution_payload(
     ticker_cache_file=None,
 ):
     """
-    4대 시나리오 × 9대 기간 × 6대 팩터 × 전 일자 daily_movers 전체 기여도 분석 페이로드 생성
+    4대 시나리오 × 9대 기간 × 6대 팩터 × 전 일자 daily_movers 전체 기여도 분석 페이로드 생성 (v1.1 실보유 반영)
     """
     now_kst = datetime.now(KST)
     today_str = now_kst.strftime("%Y-%m-%d")
@@ -990,6 +1381,7 @@ def build_attribution_payload(
     if ticker_cache is None:
         ticker_cache = ensure_ticker_history_cache(
             assets,
+            transactions=transactions,
             force_refresh=force_refresh_tickers,
             live_market_data=live_market_data,
             ticker_cache_file=ticker_cache_file,
@@ -1003,11 +1395,15 @@ def build_attribution_payload(
     min_date = all_dates[0]
     max_date = all_dates[-1]
 
-    asset_specs, evaluate_on_date = _prepare_asset_valuator(
-        assets, ticker_cache, live_market_data, min_date, max_date
+    _, sold_eval_assets, eval_assets = _collect_eval_assets(assets, transactions)
+    asset_specs, evaluate_on_date, fx_lookups = _prepare_asset_valuator(
+        eval_assets, ticker_cache, live_market_data, min_date, max_date
     )
+    tx_timeline = _build_asset_tx_timelines(asset_specs, transactions, fx_lookups)
 
-    # 커버리지 요약 (명세 §4.3)
+    # 커버리지 요약 (명세 §4.3 v1.1)
+    active_specs = [s for s in asset_specs if s.get("is_active_holding", True)]
+    sold_specs = [s for s in asset_specs if not s.get("is_active_holding", True)]
     market_specs = [
         s for s in asset_specs
         if not (not s["ticker"] or s["ticker"].startswith(("DEP-", "CASH-", "RP-")))
@@ -1024,7 +1420,10 @@ def build_attribution_payload(
     coverage_pct = round((mapped_count / len(unique_market_tickers)) * 100, 2) if unique_market_tickers else 100.0
 
     coverage = {
-        "total_active_assets": len(asset_specs),
+        "total_active_assets": len(active_specs),
+        "tracked_sold_assets": len(sold_specs),
+        "tracked_sold_asset_ids": [s["asset_id"] for s in sold_specs],
+        "total_eval_assets": len(asset_specs),
         "market_traded_assets": len(market_specs),
         "fixed_price_assets": len(fixed_specs),
         "unique_market_tickers": len(unique_market_tickers),
@@ -1036,6 +1435,9 @@ def build_attribution_payload(
     scenarios_out = {}
     for sc, cfg in SCENARIO_DEFS.items():
         sc_specs = [s for s in asset_specs if cfg["filter"](s["asset"])]
+        sc_active_count = sum(1 for s in sc_specs if s.get("is_active_holding", True))
+        sc_asset_ids = {s["asset_id"] for s in sc_specs if s.get("asset_id")}
+
         nav_dict = nav_by_scenario.get(sc, {})
         sc_dates = sorted(nav_dict.keys()) if nav_dict else [max_date]
         d_end, start_map = _resolve_period_start_dates(nav_dict)
@@ -1047,7 +1449,7 @@ def build_attribution_payload(
         ytd_b = float(nav_dict.get("2026-01-02", nav_dict.get(start_map.get("YTD", d_end), cur_v)))
         pr_map = build_period_returns(nav_dict, cur_v, ytd_b, sc)
 
-        daily_movers = _compute_daily_movers(sc_specs, evaluate_on_date, sc_dates)
+        daily_movers = _compute_daily_movers(sc_specs, evaluate_on_date, tx_timeline, sc_dates)
         non_flat_dates = [d for d in sc_dates if not daily_movers[d]["is_flat_day"]]
         fallback_trading_date = non_flat_dates[-1] if non_flat_dates else d_end
 
@@ -1056,10 +1458,13 @@ def build_attribution_payload(
             d_start = start_map.get(p, d_end)
             nav_start_h = int(round(float(nav_dict.get(d_start, 0))))
             nav_end_h = int(round(float(nav_dict.get(d_end, 0))))
-            recent_trades = _extract_recent_trades(transactions, d_start, d_end)
+            recent_trades = _extract_recent_trades(
+                transactions, d_start, d_end, allowed_asset_ids=sc_asset_ids
+            )
             periods_out[p] = _compute_period_attribution(
                 sc_specs,
                 evaluate_on_date,
+                tx_timeline,
                 d_start,
                 d_end,
                 p,
@@ -1073,13 +1478,13 @@ def build_attribution_payload(
         scenarios_out[sc] = {
             "scenario": sc,
             "label": cfg["label"],
-            "asset_count": len(sc_specs),
+            "asset_count": sc_active_count,
             "periods": periods_out,
             "daily_movers": daily_movers,
         }
 
     payload = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "status": "success",
         "as_of": max_date,
         "updated_at": now_kst.isoformat(),
@@ -1113,7 +1518,8 @@ def main():
     cov = payload["coverage"]
     print(
         f"[AttributionEngine] 완료: as_of={payload['as_of']} | "
-        f"활성자산={cov['total_active_assets']}종 (시장형 {cov['market_traded_assets']} / 고정 {cov['fixed_price_assets']}) | "
+        f"활성={cov['total_active_assets']}종 + 추적매도={cov['tracked_sold_assets']}종 "
+        f"(총 평가={cov['total_eval_assets']}종 | 시장형 {cov['market_traded_assets']} / 고정 {cov['fixed_price_assets']}) | "
         f"커버리지={cov['coverage_pct']}% (누락 {len(cov['missing_tickers'])}건)"
     )
     for sc, sc_obj in payload["scenarios"].items():

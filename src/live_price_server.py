@@ -74,6 +74,7 @@ try:
         build_attribution_payload,
         load_attribution_cache,
         normalize_scenario,
+        is_rp_trade,
         PERIOD_ORDER as ATTR_PERIOD_ORDER,
         PERIOD_LABELS as ATTR_PERIOD_LABELS,
         SCENARIO_DEFS as ATTR_SCENARIO_DEFS,
@@ -83,6 +84,7 @@ except ImportError:
         build_attribution_payload,
         load_attribution_cache,
         normalize_scenario,
+        is_rp_trade,
         PERIOD_ORDER as ATTR_PERIOD_ORDER,
         PERIOD_LABELS as ATTR_PERIOD_LABELS,
         SCENARIO_DEFS as ATTR_SCENARIO_DEFS,
@@ -174,13 +176,22 @@ def get_attribution_data(force_refresh=False, refresh_tickers=False, live_assets
 
     if not force_refresh and _attribution_cache["data"] and _attribution_cache["timestamp"]:
         age = (now - _attribution_cache["timestamp"]).total_seconds()
-        if age < ATTRIBUTION_CACHE_TTL_SECONDS and _attribution_cache["data"].get("as_of") == today_str:
+        if (
+            age < ATTRIBUTION_CACHE_TTL_SECONDS
+            and _attribution_cache["data"].get("as_of") == today_str
+            and _attribution_cache["data"].get("schema_version") == "1.1"
+        ):
             return _attribution_cache["data"]
 
     if not force_refresh and os.path.exists(ATTRIBUTION_CACHE_FILE):
         try:
             cached = load_attribution_cache(ATTRIBUTION_CACHE_FILE)
-            if cached and cached.get("as_of") == today_str and cached.get("scenarios"):
+            if (
+                cached
+                and cached.get("as_of") == today_str
+                and cached.get("schema_version") == "1.1"
+                and cached.get("scenarios")
+            ):
                 updated_iso = cached.get("updated_at")
                 use_disk = False
                 if updated_iso:
@@ -1286,13 +1297,39 @@ def _fmt_contrib(item: dict, near_flat: bool) -> str:
 
 
 def _build_rollover_notice(trades: list) -> str:
-    if not trades:
+    valid_trades = [
+        t for t in (trades or [])
+        if not is_rp_trade(t) and not t.get("is_internal_rollover")
+    ]
+    if not valid_trades:
         return ""
-    rollovers = [t for t in trades if t.get("is_internal_rollover")]
-    chosen = rollovers if rollovers else trades
+    if len(valid_trades) == 1:
+        t = valid_trades[0]
+        mmdd = _fmt_mmdd(t.get("date", ""))
+        raw_name = str(t.get("asset_name", "") or "").strip()
+        clean_name = re.sub(r"\s*\([^)]*\).*", "", raw_name).strip() or raw_name
+        aname = _short_attr_name(clean_name, 16)
+        q = float(t.get("quantity") or 0)
+        if q > 0:
+            q_str = f" {int(round(q))}주" if abs(q - round(q)) < 1e-6 else f" {q:g}주"
+        else:
+            q_str = ""
+        ttype = str(t.get("trade_type") or "").upper()
+        note_txt = str(t.get("note") or "")
+        if ttype == "SELL":
+            act = "전량매도" if "전량" in note_txt else "매도"
+            tail = f"({format_korean_money(t.get('total_amount_krw', 0))}, 매도 후 등락 제외)"
+        elif ttype == "BUY":
+            act = "신규매수" if "신규" in note_txt else "매수"
+            tail = f"({format_korean_money(t.get('total_amount_krw', 0))}, 실보유 구간 반영)"
+        else:
+            act = "매매"
+            tail = "(실보유 기준 반영)"
+        return f"ℹ️ <i>실보유 반영 매매: {html.escape(mmdd)} {html.escape(aname)}{q_str} {act}{tail}</i>"
+
     seen = set()
     parts = []
-    for t in chosen:
+    for t in valid_trades:
         mmdd = _fmt_mmdd(t.get("date", ""))
         raw_name = str(t.get("asset_name", "") or "").strip()
         clean_name = re.sub(r"\s*\([^)]*\).*", "", raw_name).strip() or raw_name
@@ -1303,11 +1340,9 @@ def _build_rollover_notice(trades: list) -> str:
             parts.append(key)
         if len(parts) >= 2:
             break
-    extra = f" 등 총 {len(chosen)}건" if len(chosen) > len(parts) else ""
+    extra = f" 등 총 {len(valid_trades)}건" if len(valid_trades) > len(parts) else ""
     joined = " · ".join(html.escape(p) for p in parts)
-    if rollovers:
-        return f"ℹ️ <i>기간 내 내부 이체·롤오버({joined}{extra})는 시세 급등락에서 제외됨</i>"
-    return f"ℹ️ <i>기간 내 매매({joined}{extra})는 일정 수량 기준에서 분리 반영됨</i>"
+    return f"ℹ️ <i>실보유 반영 매매: {joined}{extra} (거래내역 반영 실보유 기준)</i>"
 
 
 def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload: dict) -> str:
@@ -1351,7 +1386,7 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
         sc_suffix = f" <i>({html.escape(sc_label)})</i>" if scenario_key != "all" else ""
         lines = [
             refresh_banner.rstrip("\n"),
-            f"🔍 <b>[계좌 급등·급락 원인 종합 브리핑]</b> <i>{html.escape(as_of)}</i>{sc_suffix}",
+            f"🔍 <b>[계좌 급등·급락 원인 종합 브리핑]</b> <i>{html.escape(as_of)} · 실보유 기준</i>{sc_suffix}",
             "",
         ]
 
@@ -1435,7 +1470,7 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
             lines.append(
                 f"📉 <b>3. 고점대비 (MDD, {_fmt_mmdd(pmdd.get('d_start'))}~)</b> : "
                 f"NAV <b>{pmdd.get('period_return_pct', 0.0):+.2f}%</b> "
-                f"(시세 <b>{format_korean_money(pmdd.get('attr_delta_krw', 0), signed=True)}</b>, {pmdd.get('attr_return_pct', 0.0):+.2f}%)"
+                f"(실보유 <b>{format_korean_money(pmdd.get('attr_delta_krw', 0), signed=True)}</b>, {pmdd.get('attr_return_pct', 0.0):+.2f}%)"
             )
             draggers = pmdd.get("top_draggers", [])[:3]
             if draggers:
@@ -1466,11 +1501,12 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
     s_mmdd = _fmt_mmdd(p_obj.get("d_start"))
     e_mmdd = _fmt_mmdd(p_obj.get("d_end"))
     near_flat = bool(p_obj.get("is_near_flat_net"))
+    eval_count = p_obj.get("evaluated_asset_count", asset_count)
     lines = [
         refresh_banner.rstrip("\n"),
         f"🔍 <b>[{html.escape(title_core)} 변동 원인 분석]</b> <i>{s_mmdd} ~ {e_mmdd}</i>",
         "",
-        f"📌 <b>핵심 요약</b> ({html.escape(sc_label)} {asset_count}종)",
+        f"📌 <b>핵심 요약</b> ({html.escape(sc_label)} · 실보유 {eval_count}종)",
     ]
 
     if p_obj.get("is_market_closed_day"):
@@ -1480,7 +1516,7 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
         except Exception:
             is_wknd = False
         closed_tag = "주말 휴장일" if is_wknd else "휴장일/보합"
-        lines.append(f"• 시세·환율 변동합: <b>₩0</b> (0.00%, {closed_tag})")
+        lines.append(f"• 실보유 시세·환율합: <b>₩0</b> (0.00%, {closed_tag})")
         fb_date = p_obj.get("fallback_trading_date")
         fb = daily_movers.get(fb_date, {}) if fb_date else {}
         if fb:
@@ -1514,9 +1550,9 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
         nav_ret = p_obj.get("period_return_pct", 0.0)
         residual = p_obj.get("residual_krw", 0)
         lines.extend([
-            f"• 시세·환율 변동합: <b>{format_korean_money(attr_delta, signed=True)}</b> (<b>{attr_ret:+.2f}%</b>)",
+            f"• 실보유 시세·환율합: <b>{format_korean_money(attr_delta, signed=True)}</b> (<b>{attr_ret:+.2f}%</b>)",
             f"• 시계열 NAV 변동: {format_korean_money(nav_delta, signed=True)} "
-            f"(<b>{nav_ret:+.2f}%</b>, 매매·스냅샷 차 {format_korean_money(residual, signed=True)})",
+            f"(<b>{nav_ret:+.2f}%</b>, 현금흐름·스냅샷 차 {format_korean_money(residual, signed=True)})",
             "",
         ])
 
@@ -1796,8 +1832,8 @@ def generate_telegram_summary(query_text="all", force_refresh=True):
 ───────────────────────────────
 🔥 <b>위험자산 실질 순수익</b>: <b>{format_korean_money(net_profit, signed=True)}</b> (<b>{net_ret:+.2f}%</b>)"""
 
-    # (Phase 20 - 4) 거래 / 내역 / 최근거래
-    if q in ["거래", "내역", "최근거래", "trade", "trades"]:
+    # (Phase 20 - 4) 거래 / 매매 / 매매내역 / 내역 / 최근거래 (v1.1 RP 거래 제외)
+    if q in ["거래", "매매", "매매내역", "내역", "최근거래", "trade", "trades"]:
         tx_path = os.path.join(DATA_DIR, "transactions.json")
         tx_list = []
         if os.path.exists(tx_path):
@@ -1807,29 +1843,41 @@ def generate_telegram_summary(query_text="all", force_refresh=True):
             except Exception:
                 tx_list = []
 
-        if not tx_list:
-            return f"{refresh_banner}📝 <b>[최근 거래 및 입출금 내역]</b>\n\n기록된 체결 거래가 없습니다."
+        filtered_tx = [
+            tx for tx in (tx_list or [])
+            if tx.get("status", "APPLIED") == "APPLIED" and not is_rp_trade(tx)
+        ]
 
-        sorted_tx = sorted(tx_list, key=lambda x: x.get("timestamp", ""), reverse=True)[:5]
+        if not filtered_tx:
+            return (
+                f"{refresh_banner}📭 <b>[최근 매매내역]</b>\n\n"
+                "<i>기록된 주식·ETF 매매 내역이 없습니다. (RP 거래 제외)</i>"
+            )
+
+        sorted_tx = sorted(filtered_tx, key=lambda x: x.get("timestamp", ""), reverse=True)[:5]
         lines = [
-            f"{refresh_banner}📝 <b>[최근 거래 및 입출금 내역 (최근 {len(sorted_tx)}건)]</b>\n"
+            f"{refresh_banner}📝 <b>[최근 매매내역]</b> <i>(총 {len(filtered_tx)}건 · 주식·ETF 기준, RP 제외)</i>\n"
         ]
         for i, tx in enumerate(sorted_tx):
             ttype = tx.get("trade_type", "TRADE")
+            type_icon = "🔻" if ttype == "SELL" else ("🟢" if ttype == "BUY" else ("💵" if ttype == "DEPOSIT" else "💸"))
             type_label = "매도" if ttype == "SELL" else ("매수" if ttype == "BUY" else ("입금" if ttype == "DEPOSIT" else "출금"))
             aname = tx.get("asset_name", tx.get("ticker", "자산"))
-            acc = f"{tx.get('institution','')} {tx.get('account_name','')}".strip()
-            ts = tx.get("timestamp", "")[:16]
+            acc = f"{tx.get('institution', '')} {tx.get('account_name', '')}".strip()
+            ts = (tx.get("timestamp", "") or "")[:16]
 
-            lines.append(f"{i+1}. <b>[{type_label}] {html.escape(aname)}</b>")
-            lines.append(f"   • 일시: {ts} ({html.escape(acc)})")
+            lines.append(f"{i+1}. {type_icon} <b>[{type_label}] {html.escape(aname)}</b>")
+            lines.append(f"   • 일시: <code>{html.escape(ts)}</code> ({html.escape(acc)})")
 
             if ttype in ["BUY", "SELL"]:
-                qty = tx.get("quantity", 0)
-                px = tx.get("price", 0)
+                qty = float(tx.get("quantity") or 0)
+                px = float(tx.get("price") or 0)
                 tot = tx.get("total_amount_krw", tx.get("total_amount", 0))
-                lines.append(f"   • 체결: {qty:,.0f}주 × ₩{px:,.0f} ({format_korean_money(tot)})")
-                if "realized_profit_krw" in tx and tx["realized_profit_krw"] is not None:
+                q_str = f"{qty:,.0f}주" if abs(qty - round(qty)) < 1e-6 else f"{qty:g}주"
+                curr = tx.get("currency", "KRW")
+                px_str = f"₩{px:,.0f}" if curr == "KRW" else f"{px:,.2f} {curr}"
+                lines.append(f"   • 체결: {q_str} × {px_str} ({format_korean_money(tot)})")
+                if tx.get("realized_profit_krw") is not None:
                     rp = tx["realized_profit_krw"]
                     ret_str = f" ({tx.get('realized_return_pct', 0):+.2f}%)" if "realized_return_pct" in tx else ""
                     lines.append(f"   • 실현손익: <b>{format_korean_money(rp, signed=True)}</b> (<b>{ret_str.strip(' ()')}</b>)")
@@ -1839,7 +1887,7 @@ def generate_telegram_summary(query_text="all", force_refresh=True):
                 lines.append(f"   • 입출금액: {sign}{format_korean_money(amt)} (총 납입원본 반영)")
             lines.append("")
 
-        lines.append("💡 <i>거래 알림 문자를 봇에게 전송하면 자동으로 장부에 기록되고 순자산이 재계산됩니다.</i>")
+        lines.append("💡 <i>RP 단기 롤오버 거래는 리뷰에서 제외되며, 주식·ETF 거래만 실보유 기여도에 반영됩니다.</i>")
         return "\n".join(lines)
 
     # (B) 수익률
@@ -2469,6 +2517,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
                 sc = "all" if scenario_req == "full" else scenario_req
                 period_data = payload.get("scenarios", {}).get(sc, {}).get("periods", {}).get(period_req)
                 resp = {
+                    "schema_version": payload.get("schema_version", "1.1"),
                     "status": payload.get("status", "success"),
                     "as_of": payload.get("as_of"),
                     "updated_at": payload.get("updated_at"),
@@ -2482,6 +2531,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
                 if not include_daily:
                     sc_data.pop("daily_movers", None)
                 resp = {
+                    "schema_version": payload.get("schema_version", "1.1"),
                     "status": payload.get("status", "success"),
                     "as_of": payload.get("as_of"),
                     "updated_at": payload.get("updated_at"),

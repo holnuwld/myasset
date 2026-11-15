@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "updated_at": "2026-11-15T12:10:16.403667+09:00",
+  "updated_at": "2026-11-15T14:53:33.992387+09:00",
   "date_range": {
     "min_date": "2025-11-04",
     "max_date": "2026-11-15"
@@ -10,8 +10,8 @@
       "source": "yahoo_v8",
       "currency": "KRW",
       "scale": "1USD",
-      "first_real_date": "2024-11-13",
-      "last_real_date": "2026-11-13",
+      "first_real_date": "2025-11-04",
+      "last_real_date": "2026-11-15",
       "raw_dates_count": 518,
       "prices": {
         "2025-11-04": 1428.969970703125,
@@ -397,8 +397,8 @@
       "source": "yahoo_v8",
       "currency": "KRW",
       "scale": "1JPY",
-      "first_real_date": "2024-11-13",
-      "last_real_date": "2026-11-13",
+      "first_real_date": "2025-11-04",
+      "last_real_date": "2026-11-15",
       "raw_dates_count": 518,
       "prices": {
         "2025-11-04": 9.266240119934082,
@@ -18927,10 +18927,12 @@
   },
   "coverage": {
     "total_active_assets": 61,
-    "market_traded_assets": 49,
+    "tracked_sold_assets": 1,
+    "total_eval_assets": 62,
+    "market_traded_assets": 50,
     "fixed_price_assets": 12,
-    "unique_market_tickers": 46,
-    "mapped_tickers_count": 46,
+    "unique_market_tickers": 47,
+    "mapped_tickers_count": 47,
     "missing_tickers": [],
     "coverage_pct": 100.0
   }
