@@ -507,7 +507,7 @@ def ensure_ticker_history_cache(
 
 
 def _build_hybrid_nav_by_scenario(
-    calc_cache, asset_history, today_str, live_market_data, assets
+    calc_cache, asset_history, today_str, live_market_data, assets, clip_to_today=False
 ):
     """
     src/live_price_server.py의 generate_hybrid_history()와 100% 동일한 4대 시나리오 일별 NAV 맵 구축.
@@ -527,11 +527,17 @@ def _build_hybrid_nav_by_scenario(
 
     nav_maps = {}
     for sc, cfg in SCENARIO_DEFS.items():
-        nav = dict(calc_cache.get(cfg["cache_key"], {}))
+        raw_calc = calc_cache.get(cfg["cache_key"], {})
+        if clip_to_today:
+            nav = {d: v for d, v in raw_calc.items() if d <= today_str}
+        else:
+            nav = dict(raw_calc)
         hk = cfg["hist_key"]
         for item in asset_history:
             d = item.get("date")
             if d and d >= "2026-11-03" and item.get(hk) is not None:
+                if clip_to_today and d > today_str:
+                    continue
                 nav[d] = item[hk]
 
         # 오늘자 NAV 반영
@@ -590,11 +596,29 @@ def _prepare_asset_valuator(eval_assets, ticker_cache, live_market_data, min_dat
     tcache_tickers = ticker_cache.get("tickers", {})
     tcache_fx = ticker_cache.get("fx", {})
 
+    has_live_market_move = False
+    if not is_weekend and live_prices:
+        for t, entry in tcache_tickers.items():
+            p_map = entry.get("prices") or {}
+            if not p_map:
+                continue
+            last_d = max(p_map.keys())
+            if max_date <= last_d:
+                has_live_market_move = True
+                break
+            last_px = float(p_map[last_d])
+            live_item = live_prices.get(t, {})
+            live_px = live_item.get("price") if isinstance(live_item, dict) else None
+            if live_px is not None and float(live_px) > 0 and abs(float(live_px) - last_px) > 1e-4:
+                has_live_market_move = True
+                break
+    apply_live_overlay = (not is_weekend) and has_live_market_move
+
     fx_lookups = {}
     for fx_key, default_rate, live_k in [("KRW=X", 1336.2, "USDKRW"), ("JPYKRW=X", 8.343, "JPYKRW")]:
         raw_p = dict((tcache_fx.get(fx_key) or {}).get("prices") or {})
         live_v = live_fx.get(live_k)
-        if live_v and (not is_weekend or not raw_p):
+        if live_v and (apply_live_overlay or not raw_p):
             fv = float(live_v)
             if fx_key == "JPYKRW=X" and fv > 100:
                 fv = fv / 100.0
@@ -607,7 +631,7 @@ def _prepare_asset_valuator(eval_assets, ticker_cache, live_market_data, min_dat
         raw_p = dict(entry.get("prices") or {})
         live_item = live_prices.get(t, {})
         live_px = live_item.get("price") if isinstance(live_item, dict) else None
-        if live_px is not None and float(live_px) > 0 and (not is_weekend or not raw_p):
+        if live_px is not None and float(live_px) > 0 and (apply_live_overlay or not raw_p):
             raw_p[max_date] = float(live_px)
         ticker_lookups[t] = _build_date_lookup(raw_p, min_date, max_date)
         ticker_meta[t] = {
@@ -1362,12 +1386,14 @@ def build_attribution_payload(
     save_cache=True,
     attribution_cache_file=None,
     ticker_cache_file=None,
+    as_of_date=None,
 ):
     """
     4대 시나리오 × 9대 기간 × 6대 팩터 × 전 일자 daily_movers 전체 기여도 분석 페이로드 생성 (v1.1 실보유 반영)
     """
     now_kst = datetime.now(KST)
-    today_str = now_kst.strftime("%Y-%m-%d")
+    as_of_norm = str(as_of_date).strip()[:10] if (as_of_date and str(as_of_date).strip()) else ""
+    today_str = as_of_norm if as_of_norm else now_kst.strftime("%Y-%m-%d")
 
     if assets is None:
         assets = _load_json_safe(ASSETS_FILE, [])
@@ -1389,7 +1415,7 @@ def build_attribution_payload(
         )
 
     nav_by_scenario = _build_hybrid_nav_by_scenario(
-        calc_cache, asset_history, today_str, live_market_data, assets
+        calc_cache, asset_history, today_str, live_market_data, assets, clip_to_today=bool(as_of_norm)
     )
     all_dates = sorted(nav_by_scenario["all"].keys()) if nav_by_scenario.get("all") else [today_str]
     min_date = all_dates[0]

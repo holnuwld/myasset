@@ -1345,6 +1345,14 @@ def _build_rollover_notice(trades: list) -> str:
     return f"ℹ️ <i>실보유 반영 매매: {joined}{extra} (거래내역 반영 실보유 기준)</i>"
 
 
+def _non_rp_movers(items: list) -> list:
+    """텔레그램 /원인 출력 시 RP 파킹 통장 항목(일반RP·외화RP 등)을 제외한다."""
+    return [
+        x for x in (items or [])
+        if isinstance(x, dict) and not is_rp_trade({"ticker": x.get("ticker"), "asset_name": x.get("name")})
+    ]
+
+
 def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload: dict) -> str:
     """
     모바일 텔레그램 /원인 명령어 포매터 (명세 §6)
@@ -1411,11 +1419,11 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
                     )
                     ld_s = " │ ".join(
                         f"{html.escape(_short_attr_name(x['name']))} {format_korean_money(x['delta_krw'], signed=True)}({x['delta_pct']:+.1f}%)"
-                        for x in fb.get("top_leaders", [])[:2]
+                        for x in _non_rp_movers(fb.get("top_leaders", []))[:2]
                     )
                     dr_s = " │ ".join(
                         f"{html.escape(_short_attr_name(x['name']))} {format_korean_money(x['delta_krw'], signed=True)}({x['delta_pct']:+.1f}%)"
-                        for x in fb.get("top_draggers", [])[:2]
+                        for x in _non_rp_movers(fb.get("top_draggers", []))[:2]
                     )
                     if ld_s:
                         lines.append(f"  • ▲ {ld_s}")
@@ -1429,11 +1437,11 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
                 )
                 ld_s = " │ ".join(
                     f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
-                    for x in p1d.get("top_leaders", [])[:2]
+                    for x in _non_rp_movers(p1d.get("top_leaders", []))[:2]
                 )
                 dr_s = " │ ".join(
                     f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
-                    for x in p1d.get("top_draggers", [])[:2]
+                    for x in _non_rp_movers(p1d.get("top_draggers", []))[:2]
                 )
                 if ld_s:
                     lines.append(f"  • ▲ {ld_s}")
@@ -1451,11 +1459,11 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
             )
             ld_s = " │ ".join(
                 f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
-                for x in p1w.get("top_leaders", [])[:2]
+                for x in _non_rp_movers(p1w.get("top_leaders", []))[:2]
             )
             dr_s = " │ ".join(
                 f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
-                for x in p1w.get("top_draggers", [])[:2]
+                for x in _non_rp_movers(p1w.get("top_draggers", []))[:2]
             )
             if ld_s:
                 lines.append(f"  • 🚀 견인: {ld_s}")
@@ -1472,7 +1480,7 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
                 f"NAV <b>{pmdd.get('period_return_pct', 0.0):+.2f}%</b> "
                 f"(실보유 <b>{format_korean_money(pmdd.get('attr_delta_krw', 0), signed=True)}</b>, {pmdd.get('attr_return_pct', 0.0):+.2f}%)"
             )
-            draggers = pmdd.get("top_draggers", [])[:3]
+            draggers = _non_rp_movers(pmdd.get("top_draggers", []))[:3]
             if draggers:
                 lines.append("  • 🔻 주범 Top 3:")
                 for idx, item in enumerate(draggers, 1):
@@ -1525,8 +1533,8 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
                 f"<b>{format_korean_money(fb.get('day_delta_krw', 0), signed=True)}</b> ({fb.get('day_return_pct', 0.0):+.2f}%)",
                 "",
             ])
-            fb_leaders = fb.get("top_leaders", [])[:3]
-            fb_draggers = fb.get("top_draggers", [])[:3]
+            fb_leaders = _non_rp_movers(fb.get("top_leaders", []))[:3]
+            fb_draggers = _non_rp_movers(fb.get("top_draggers", []))[:3]
             if fb_leaders:
                 lines.append("🚀 <b>직전 거래일 상승 견인 Top 3</b>")
                 for idx, item in enumerate(fb_leaders, 1):
@@ -1556,8 +1564,8 @@ def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload:
             "",
         ])
 
-        leaders = p_obj.get("top_leaders", [])
-        draggers = p_obj.get("top_draggers", [])
+        leaders = _non_rp_movers(p_obj.get("top_leaders", []))
+        draggers = _non_rp_movers(p_obj.get("top_draggers", []))
         if attr_delta < 0:
             if draggers:
                 lines.append("🔻 <b>주요 하락 주범 Top 5</b>")
@@ -2640,7 +2648,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
     def handle_api_health(self):
         res = json.dumps({
             "status": "running",
-            "service": "Asset Control Tower Unified Web & Price Server v4.8",
+            "service": "Asset Control Tower Unified Web & Price Server v5.3",
             "host": HOST,
             "port": PORT,
             "ips": get_server_ips(),
@@ -2711,7 +2719,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
 def run_server():
     global _backfill_status
     print("=" * 60)
-    print("🏛️ [Asset Control Tower v4.8] 시스템 기동 중...")
+    print("🏛️ [Asset Control Tower v5.3] 시스템 기동 중...")
     print("   [1/3] 과거 누락 시세(Gap) 자동 소급 검사 수행 중...")
     try:
         _backfill_status = run_auto_backfill()

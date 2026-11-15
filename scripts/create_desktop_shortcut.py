@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 scripts/create_desktop_shortcut.py
-Creates a Desktop Shortcut for Asset Control Tower v4.8 using Win32 API.
+Creates a Desktop Shortcut for Asset Control Tower v5.3 using Win32 API.
 """
 
 import os
@@ -28,7 +28,7 @@ $ws = New-Object -ComObject WScript.Shell
 $s = $ws.CreateShortcut('{temp_lnk}')
 $s.TargetPath = '{target}'
 $s.WorkingDirectory = '{working}'
-$s.Description = '자산 관제탑 (Asset Control Tower v4.8) 원클릭 런처'
+$s.Description = '자산 관제탑 (Asset Control Tower v5.3) 원클릭 런처'
 $s.IconLocation = 'shell32.dll, 44'
 $s.Save()
 """

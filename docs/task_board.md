@@ -1,7 +1,16 @@
 # 자산 관리 프로그램 작업 보드 (`task_board.md`)
 
 > **관리자**: 비서 (Main Orchestrator)  
-> **문서 버전**: v5.3.1 완료 (Phase 23.1: 거래내역 반영 실보유 기준 기여도 산출 및 매매내역 리뷰 RP 제외)  
+> **문서 버전**: v5.3.2 완료 (Phase 23.2: 스마트폰 UX 폴리싱, 메인 워크트리 병합, 바탕화면 바로가기·GitHub 반영)  
+
+---
+
+## Phase 23.2 (v5.3.2): 스마트폰 뷰포트/터치 폴리싱 및 메인 워크트리 병합·배포
+
+| ID | 단계 및 작업 항목 | 담당 에이전트 | 상태 | 세부 내용 및 산출물 |
+| :-: | :--- | :---: | :---: | :--- |
+| **T-28-12** | **스마트폰 풀폭/초소형(360px) 레이아웃·터치 리스너·자정경과 정합성·v5.3 런처 동기화** | `developer` | ✅ 완료 | `build_web_index.py` 모바일 풀폭·`<=370px` 가드·`addEventListener("touchstart"/"touchmove")` 및 `src/attribution_engine.py`(`as_of_date`, `clip_to_today`, 장전 FX 반올림 노이즈 차단)·`src/live_price_server.py`(`_non_rp_movers` 텔레그램 `/원인` RP 제외)·`scripts/create_desktop_shortcut.py` v5.3 동기화·`tests/test_attribution_qa.py`(`as_of_date`, `setUpClass`/`tearDownClass` 복원), `web/index.html`(2,051,317B) 재컴파일 및 `node --check`·`py_compile` exit 0 |
+| **T-28-13** | **5종 스마트폰 뷰포트(360px~430px)·터치·상대경로(`API_BASE`)·자정 회귀 E2E 검증** | `qa-verifier` | ✅ 완료 | `tests/verify_attribution_ui.js`(exit 0: 5종 스마트폰 `360x800`~`430x932` 가로 오버플로우 0건·풀폭·`132px`/`142px`·`.attr-delta-shade` 단조성·기본 CDP 터치 스크러빙 날짜/Top2 동적 갱신·`API_BASE === ""`·에러 0건) 및 `tests/test_attribution_qa.py`(8/8 PASS, exit 0) `APPROVED`, 메인 병합·바탕화면 아이콘·GitHub 푸시 반영 |
 
 ---
 

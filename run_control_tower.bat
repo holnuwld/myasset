@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title [Asset Control Tower v4.8] Live Server
+title [Asset Control Tower v5.3] Live Server
 
 set "PYTHON_EXE=C:\Users\pobco\.local\bin\python3.12.exe"
 if not exist "%PYTHON_EXE%" (
@@ -23,7 +23,7 @@ if "%PYTHON_EXE%"=="" (
 
 cd /d "%~dp0"
 echo ======================================================================
-echo           Asset Control Tower v4.8 - Live Server
+echo           Asset Control Tower v5.3 - Live Server
 echo ======================================================================
 echo   Python: %PYTHON_EXE%
 echo   Local:  http://127.0.0.1:8765/

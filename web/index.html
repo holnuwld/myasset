@@ -1368,6 +1368,7 @@
       width: 100%;
       height: 100%;
       overflow: visible;
+      touch-action: pan-y;
     }
     .chart-tooltip {
       position: absolute;
@@ -1817,7 +1818,7 @@
       .btn-text-full { display: none !important; }
       .btn-text-mobile { display: inline !important; }
       .hide-mobile { display: none !important; }
-      .container { padding: 10px 4px; width: 100%; max-width: 382px; margin: 0; box-sizing: border-box; }
+      .container { padding: 10px 6px; width: 100%; max-width: 100%; margin: 0 auto; box-sizing: border-box; }
       header { padding: 8px 0 12px 0; gap: 8px; display: flex; flex-direction: column; align-items: stretch; width: 100%; box-sizing: border-box; }
       .brand-wrap { width: 100%; display: flex; align-items: center; gap: 8px; }
       .brand-text { min-width: 0; flex: 1; }
@@ -1900,7 +1901,7 @@
       .multi-grid { grid-template-columns: 1fr; gap: 10px; width: 100%; box-sizing: border-box; }
       .alert-grid { grid-template-columns: 1fr; gap: 8px; width: 100%; box-sizing: border-box; }
       .table-container { width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box; }
-      .fab-bar, .floating-bar { padding: 8px 12px !important; gap: 8px !important; border-radius: 999px !important; display: flex !important; flex-direction: row !important; align-items: center !important; justify-content: space-between !important; width: calc(100% - 16px) !important; max-width: 376px !important; bottom: 10px !important; left: 50% !important; transform: translateX(-50%) !important; white-space: nowrap !important; }
+      .fab-bar, .floating-bar { padding: 8px 12px !important; gap: 8px !important; border-radius: 999px !important; display: flex !important; flex-direction: row !important; align-items: center !important; justify-content: space-between !important; width: calc(100% - 16px) !important; max-width: 420px !important; bottom: 10px !important; left: 50% !important; transform: translateX(-50%) !important; white-space: nowrap !important; }
       .fab-bar div, .floating-bar div { display: flex !important; align-items: center !important; gap: 6px !important; min-width: 0 !important; flex-shrink: 1 !important; font-size: 0.72rem !important; }
       .fab-bar span, .floating-bar span { font-size: 0.72rem !important; white-space: nowrap !important; }
       .fab-bar button, .floating-bar button { padding: 6px 10px !important; font-size: 0.72rem !important; white-space: nowrap !important; flex-shrink: 0 !important; }
@@ -1908,10 +1909,15 @@
     }
 
     @media (max-width: 480px) {
-      .floating-bar, .fab-bar { padding: 8px 12px !important; gap: 8px !important; border-radius: 999px !important; display: flex !important; flex-direction: row !important; align-items: center !important; justify-content: space-between !important; width: calc(100% - 16px) !important; max-width: 376px !important; bottom: 10px !important; left: 50% !important; transform: translateX(-50%) !important; white-space: nowrap !important; }
+      .floating-bar, .fab-bar { padding: 8px 12px !important; gap: 8px !important; border-radius: 999px !important; display: flex !important; flex-direction: row !important; align-items: center !important; justify-content: space-between !important; width: calc(100% - 16px) !important; max-width: 420px !important; bottom: 10px !important; left: 50% !important; transform: translateX(-50%) !important; white-space: nowrap !important; }
       .floating-bar div, .fab-bar div { display: flex !important; align-items: center !important; gap: 6px !important; min-width: 0 !important; flex-shrink: 1 !important; font-size: 0.72rem !important; }
       .floating-bar span, .fab-bar span { font-size: 0.72rem !important; white-space: nowrap !important; }
       .floating-bar button, .fab-bar button { padding: 6px 10px !important; font-size: 0.72rem !important; white-space: nowrap !important; flex-shrink: 0 !important; }
+    }
+
+    @media (max-width: 370px) {
+      .attr-mover-right { width: 132px !important; flex: 0 0 132px !important; }
+      .attr-mover-name { max-width: 118px !important; }
     }
   </style>
 </head>
@@ -2272,7 +2278,7 @@
           <g id="chartPeakTroughMarkers"></g>
           <line id="chartHoverLine" x1="0" y1="0" x2="0" y2="300" stroke="#0ea5e9" stroke-width="1.5" stroke-dasharray="3 3" style="display:none;"></line>
           <circle id="chartHoverDot" r="4.5" fill="#0ea5e9" stroke="#fff" stroke-width="2" style="display:none;"></circle>
-          <rect id="chartOverlayRect" width="960" height="300" fill="transparent" style="cursor:crosshair;"></rect>
+          <rect id="chartOverlayRect" width="960" height="300" fill="transparent" style="cursor:crosshair; touch-action: pan-y;"></rect>
         </svg>
       </div>
 
@@ -6723,13 +6729,15 @@
       }
 
       if (overlay) {
-        overlay.onmousemove = (e) => {
+        const handleChartPointer = (clientX) => {
+          if (typeof clientX !== "number" || Number.isNaN(clientX)) return;
           const rect = overlay.getBoundingClientRect();
-          const mouseX = e.clientX - rect.left;
-          const svgX = (mouseX / rect.width) * W;
+          if (!rect || !rect.width || !coords || coords.length === 0) return;
+          const pointerX = clientX - rect.left;
+          const svgX = (pointerX / rect.width) * W;
 
           let closest = coords[0];
-          let minDist = 99999;
+          let minDist = Infinity;
           coords.forEach(c => {
             const dist = Math.abs(c.x - svgX);
             if (dist < minDist) { minDist = dist; closest = c; }
@@ -6749,6 +6757,22 @@
 
           updateHoverBanner(closest.data);
         };
+
+        const handleTouch = (e) => {
+          if (e.touches && e.touches.length > 0) handleChartPointer(e.touches[0].clientX);
+        };
+        overlay.onmousemove = (e) => handleChartPointer(e.clientX);
+        overlay.ontouchstart = handleTouch;
+        overlay.ontouchmove = handleTouch;
+        if (typeof overlay.removeEventListener === "function" && overlay._boundTouchHandler) {
+          overlay.removeEventListener("touchstart", overlay._boundTouchHandler);
+          overlay.removeEventListener("touchmove", overlay._boundTouchHandler);
+        }
+        if (typeof overlay.addEventListener === "function") {
+          overlay._boundTouchHandler = handleTouch;
+          overlay.addEventListener("touchstart", handleTouch, { passive: true });
+          overlay.addEventListener("touchmove", handleTouch, { passive: true });
+        }
 
         overlay.onmouseleave = () => {
           if (hoverLine) hoverLine.style.display = "none";

@@ -20,7 +20,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const http = require("http");
+const net = require("net");
 const vm = require("vm");
 const assert = require("assert");
 const { execFileSync, spawn } = require("child_process");
@@ -29,6 +29,20 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 const INDEX_HTML_PATH = path.join(REPO_ROOT, "web", "index.html");
 const ATTR_CACHE_PATH = path.join(REPO_ROOT, "data", "attribution_cache.json");
 const TX_JSON_PATH = path.join(REPO_ROOT, "data", "transactions.json");
+const SERVER_SCRIPT_PATH = path.join(REPO_ROOT, "src", "live_price_server.py");
+const ISOLATED_PORT = 8766;
+const PYTHON_EXE = process.env.PYTHON_EXE
+  || (fs.existsSync("C:\\Users\\pobco\\.local\\bin\\python3.12.exe")
+    ? "C:\\Users\\pobco\\.local\\bin\\python3.12.exe"
+    : "python");
+
+const MOBILE_VIEWPORTS = [
+  { width: 360, height: 800, deviceScaleFactor: 3, expectedMoverWidthPx: 132, label: "360x800" },
+  { width: 375, height: 812, deviceScaleFactor: 3, expectedMoverWidthPx: 142, label: "375x812" },
+  { width: 390, height: 844, deviceScaleFactor: 3, expectedMoverWidthPx: 142, label: "390x844" },
+  { width: 412, height: 915, deviceScaleFactor: 2.625, expectedMoverWidthPx: 142, label: "412x915" },
+  { width: 430, height: 932, deviceScaleFactor: 3, expectedMoverWidthPx: 142, label: "430x932" }
+];
 
 const EXPECTED_PERIODS_9 = [
   "1Y", "YTD", "6M", "3M", "1M", "1W", "1D", "peak_drawdown", "trough_gain"
@@ -440,11 +454,25 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
   ctx.sortTable("return_rate");
   assert.strictEqual(vm.runInContext("currentSortKey + ':' + currentSortOrder", ctx), "return_rate:desc");
 
-  console.log("  -> PASS: Node VM + Mock DOM (v1.1 isRpTrade, #tradesTable RP제외, AST-037 배지, 9기간·4시나리오·7탭) 통과");
+  // 4) API_BASE 상대경로/file 분기 검증 (HTTP Tailscale/LAN -> "", file: -> http://127.0.0.1:8765)
+  assert.strictEqual(vm.runInContext("API_BASE", ctx), "", "VM HTTP origin API_BASE must be empty string");
+  for (const [proto, expectedBase] of [
+    ["http:", ""],
+    ["https:", ""],
+    ["file:", "http://127.0.0.1:8765"]
+  ]) {
+    const apiBaseVal = vm.runInNewContext(
+      `(window.location.protocol === 'file:') ? 'http://127.0.0.1:8765' : ''`,
+      { window: { location: { protocol: proto, hostname: "100.74.98.51", port: "8765" } } }
+    );
+    assert.strictEqual(apiBaseVal, expectedBase, `API_BASE mismatch for protocol=${proto}`);
+  }
+
+  console.log("  -> PASS: Node VM + Mock DOM (v1.1 isRpTrade, #tradesTable RP제외, AST-037 배지, 9기간·4시나리오·7탭·API_BASE) 통과");
 }
 
 // ============================================================================
-// STEP 4: 격리 HTTP 서버 + 실제 Headless Chrome CDP 브라우저 E2E 검증
+// STEP 4: 격리 라이브 서버(PORT=8766, DISABLE_TG_POLL=1, NO_BROWSER=1) + Chrome CDP E2E
 // ============================================================================
 function findBrowserExe() {
   const candidates = [
@@ -456,47 +484,108 @@ function findBrowserExe() {
   return candidates.find(p => fs.existsSync(p)) || null;
 }
 
-function startEphemeralServer(html, diskAttr, txJson) {
-  return new Promise((resolve, reject) => {
-    const server = http.createServer((req, res) => {
-      const urlObj = new URL(req.url, "http://127.0.0.1");
-      const pathname = urlObj.pathname;
-
-      const sendJson = (code, payload) => {
-        res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
-        res.end(JSON.stringify(payload));
-      };
-
-      if (pathname === "/" || pathname === "/index.html" || pathname === "/web/index.html") {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-        res.end(html);
-        return;
-      }
-      if (pathname === "/api/health") {
-        return sendJson(200, { status: "running", isolated_ui_test: true, backfill_status: { state: "idle" } });
-      }
-      if (pathname === "/api/attribution") {
-        return sendJson(200, { status: "success", ...diskAttr });
-      }
-      if (pathname === "/api/history") {
-        return sendJson(200, { status: "local_embedded", message: "Using embedded DEFAULT_HISTORY_CACHE in UI test" });
-      }
-      if (pathname === "/api/transactions") {
-        return sendJson(200, { status: "success", transactions: Array.isArray(txJson) ? txJson : (txJson.transactions || []) });
-      }
-      if (pathname === "/favicon.ico") {
-        res.writeHead(204);
-        res.end();
-        return;
-      }
-      return sendJson(404, { status: "error", message: `Unhandled test route: ${pathname}` });
-    });
-
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: server.address().port });
-    });
+function isTcpPortOpen(port, host = "127.0.0.1", timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const sock = new net.Socket();
+    let settled = false;
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      try { sock.destroy(); } catch (_) {}
+      resolve(result);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once("connect", () => done(true));
+    sock.once("timeout", () => done(false));
+    sock.once("error", () => done(false));
+    sock.connect(port, host);
   });
+}
+
+async function startIsolatedLiveServer8766() {
+  const alreadyOpen = await isTcpPortOpen(ISOLATED_PORT);
+  assert(!alreadyOpen, `Isolated port ${ISOLATED_PORT} is already occupied before UI test!`);
+
+  const serverProc = spawn(PYTHON_EXE, [SERVER_SCRIPT_PATH], {
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      PORT: String(ISOLATED_PORT),
+      DISABLE_TG_POLL: "1",
+      NO_BROWSER: "1",
+      PYTHONUTF8: "1"
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  let stdoutLog = "";
+  let stderrLog = "";
+  serverProc.stdout.on("data", (d) => { stdoutLog += d.toString("utf-8"); });
+  serverProc.stderr.on("data", (d) => { stderrLog += d.toString("utf-8"); });
+
+  const baseUrl = `http://127.0.0.1:${ISOLATED_PORT}`;
+  let health = null;
+  const deadline = Date.now() + 25000;
+  while (Date.now() < deadline) {
+    if (serverProc.exitCode !== null) {
+      throw new Error(
+        `Isolated live_price_server.py exited prematurely (code=${serverProc.exitCode}):\n${stdoutLog}\n${stderrLog}`
+      );
+    }
+    try {
+      const res = await fetch(`${baseUrl}/api/health`);
+      if (res.ok) {
+        health = await res.json();
+        break;
+      }
+    } catch (_) {
+      // Wait for server bind
+    }
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  assert(health, `Isolated server on ${baseUrl} did not respond /api/health within 25s:\n${stdoutLog}\n${stderrLog}`);
+  assert.strictEqual(health.status, "running", `Unexpected /api/health status: ${JSON.stringify(health)}`);
+  assert.strictEqual(health.port, ISOLATED_PORT, `Unexpected /api/health port: ${JSON.stringify(health)}`);
+  assert(
+    String(health.service || "").includes("v5.3"),
+    `Expected /api/health service to contain 'v5.3', got: ${health.service}`
+  );
+
+  const tgRes = await fetch(`${baseUrl}/api/telegram/status`);
+  assert.strictEqual(tgRes.status, 200, "Failed /api/telegram/status check");
+  const tgJson = await tgRes.json();
+  assert.strictEqual(tgJson.status, "polling_disabled", `Expected polling_disabled on 8766, got: ${JSON.stringify(tgJson)}`);
+
+  console.log(`  -> PASS [격리 서버 8766]: service="${health.service}", telegram="${tgJson.status}", NO_BROWSER=1`);
+
+  async function stop() {
+    if (serverProc.exitCode === null) {
+      try { serverProc.kill(); } catch (_) {}
+      await Promise.race([
+        new Promise(r => serverProc.once("exit", r)),
+        new Promise(r => setTimeout(r, 3000))
+      ]);
+      if (serverProc.exitCode === null) {
+        try { serverProc.kill("SIGKILL"); } catch (_) {}
+        if (process.platform === "win32" && serverProc.pid) {
+          try { execFileSync("taskkill", ["/PID", String(serverProc.pid), "/T", "/F"], { stdio: "ignore" }); } catch (_) {}
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+    let closed = false;
+    for (let i = 0; i < 20; i++) {
+      if (!(await isTcpPortOpen(ISOLATED_PORT, "127.0.0.1", 250))) {
+        closed = true;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 150));
+    }
+    assert(closed, `Isolated port ${ISOLATED_PORT} remained occupied after server shutdown`);
+  }
+
+  return { baseUrl, health, serverProc, stop };
 }
 
 class CDPClient {
@@ -639,9 +728,11 @@ async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, vie
           rowCount: rows.length,
           expectedCount: srcList.length,
           rows: rows.map((row, idx) => {
+            const rightEl = row.querySelector('.attr-mover-right');
             const deltaEl = row.querySelector('.attr-mover-delta');
             const shadeEl = deltaEl ? deltaEl.querySelector('.attr-delta-shade') : null;
             const valEl = deltaEl ? deltaEl.querySelector('.attr-delta-val') : null;
+            const rightRect = rightEl ? rightEl.getBoundingClientRect() : null;
             const deltaRect = deltaEl ? deltaEl.getBoundingClientRect() : null;
             const shadeRect = shadeEl ? shadeEl.getBoundingClientRect() : null;
             const valText = valEl ? valEl.innerText.trim() : (deltaEl ? deltaEl.innerText.trim() : '');
@@ -657,6 +748,7 @@ async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, vie
               shadeBg: shadeEl ? getComputedStyle(shadeEl).backgroundColor : '',
               inlineWidth: shadeEl ? shadeEl.style.width : '',
               stylePct: shadeEl ? parseFloat(shadeEl.style.width) : NaN,
+              rightWidth: rightRect ? rightRect.width : NaN,
               deltaWidth: deltaRect ? deltaRect.width : NaN,
               deltaRight: deltaRect ? deltaRect.right : NaN,
               shadeWidth: shadeRect ? shadeRect.width : NaN,
@@ -684,7 +776,11 @@ async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, vie
         const r = col.rows[i];
         const rowLabel = `${ctxLabel}[row${i + 1}]`;
 
-        // 1) .attr-mover-delta 실측 width 5개 행 모두 오차 없이 동일함 (184px / 모바일 142px)
+        // 1) .attr-mover-right 및 .attr-mover-delta 실측 width 5개 행 모두 오차 없이 동일함 (184px / 모바일 132px·142px)
+        assert(
+          Math.abs(r.rightWidth - expectedWidthPx) <= 0.01,
+          `${rowLabel} .attr-mover-right width=${r.rightWidth} != expected ${expectedWidthPx}px`
+        );
         assert(
           Math.abs(r.deltaWidth - expectedWidthPx) <= 0.01,
           `${rowLabel} .attr-mover-delta width=${r.deltaWidth} != expected ${expectedWidthPx}px`
@@ -769,12 +865,12 @@ async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, vie
 }
 
 async function verifyRealBrowserE2E(html, diskAttr, txJson) {
-  console.log("[STEP 4] 실제 Headless Chrome CDP 브라우저 E2E 검증 (격리 HTTP 서버, 8765 무관)...");
+  console.log(`[STEP 4] 실제 Headless Chrome CDP 브라우저 E2E 검증 (격리 라이브 서버 PORT=${ISOLATED_PORT}, DISABLE_TG_POLL=1, NO_BROWSER=1)...`);
   const browserExe = findBrowserExe();
   assert(browserExe, "Chrome/Edge headless browser not found on system");
 
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "attr-chrome-qa-"));
-  const { server, port } = await startEphemeralServer(html, diskAttr, txJson);
+  const isolatedServer = await startIsolatedLiveServer8766();
 
   let proc = null;
   let cdp = null;
@@ -784,6 +880,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     await cdp.send("Page.enable");
     await cdp.send("Runtime.enable");
     await cdp.send("Log.enable");
+    await cdp.send("Network.enable");
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 1280,
       height: 900,
@@ -791,10 +888,10 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       mobile: false
     });
 
-    const targetUrl = `http://127.0.0.1:${port}/`;
+    const targetUrl = `${isolatedServer.baseUrl}/`;
     await cdp.send("Page.navigate", { url: targetUrl });
 
-    // 초기 렌더링 + /api/attribution + /api/transactions 동기화 대기
+    // 초기 렌더링 + /api/attribution + /api/history + /api/transactions 동기화 대기
     await waitUntil(async () => {
       return await cdp.eval(`(() => {
         const r = document.querySelectorAll('#assetsTableBody tr').length;
@@ -803,9 +900,19 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
         const tb = document.getElementById('tradesCountBadge')?.innerText || '';
         return r === 61 && f === 6 && h.length > 0 && tb.length > 0 &&
           typeof attributionServerData === 'object' && attributionServerData !== null &&
+          typeof historyServerData === 'object' && historyServerData !== null &&
           Array.isArray(currentTransactions);
       })()`);
-    }, 12000, "initial render + /api/attribution & /api/transactions sync");
+    }, 25000, "initial render + /api/attribution & /api/history & /api/transactions sync");
+
+    // 동일 오리진 상대경로 API_BASE === '' 즉시 확인
+    const initOriginInfo = await cdp.eval(`({
+      origin: window.location.origin,
+      protocol: window.location.protocol,
+      apiBase: API_BASE
+    })`);
+    assert.strictEqual(initOriginInfo.origin, isolatedServer.baseUrl);
+    assert.strictEqual(initOriginInfo.apiBase, "", `Expected API_BASE === '' on HTTP origin, got "${initOriginInfo.apiBase}"`);
 
     // 초기 렌더링 직후 슬림 Top 5 Movers 바 0건 & 6대 팩터 바 6건 단언
     const initBarCounts = await cdp.eval(`(() => ({
@@ -1010,6 +1117,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       return {
         idx13,
         idx14,
+        latestDate: filtered[filtered.length - 1].date,
         clientY: rect.top + rect.height * 0.5,
         x13: toClientX(idx13),
         x14: toClientX(idx14)
@@ -1043,16 +1151,20 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     assert(hover14.hasFlat && hover14.rowText.includes("휴장일"));
 
     await cdp.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: 1, y: 1 });
-    await waitUntil(async () => (await cdp.eval(`document.getElementById('hoverDate').innerText`)) === "2026-11-15", 3000, "mouseleave restore");
+    await waitUntil(
+      async () => (await cdp.eval(`document.getElementById('hoverDate').innerText`)) === hoverCoords.latestDate,
+      3000,
+      "mouseleave restore"
+    );
     const hoverOut = await cdp.eval(`({
       date: document.getElementById('hoverDate').innerText,
       lineDisp: document.getElementById('chartHoverLine').style.display,
       rowText: document.getElementById('hoverMoversRow').innerText
     })`);
-    assert.strictEqual(hoverOut.date, "2026-11-15");
+    assert.strictEqual(hoverOut.date, hoverCoords.latestDate);
     assert.strictEqual(hoverOut.lineDisp, "none");
-    assert(hoverOut.rowText.includes("휴장일"));
-    console.log("  -> PASS [기능 2]: 차트 호버 2026-11-13(Top2 칩) / 2026-11-14(휴장일) / mouseleave(2026-11-15 복귀) 확인");
+    assert(hoverOut.rowText.length > 0, "mouseleave latest date rowText must be non-empty");
+    console.log(`  -> PASS [기능 2]: 차트 호버 2026-11-13(Top2 칩) / 2026-11-14(휴장일) / mouseleave(${hoverCoords.latestDate} 복귀) 확인`);
 
     // ------------------------------------------------------------------------
     // 기능 3: #assetsTablePeriodTabs 7개 탭 전환 및 정렬 검증
@@ -1132,68 +1244,360 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     console.log("  -> PASS [기능 3]: #assetsTablePeriodTabs 7개 탭 전환, 61행, 1M/YTD 정렬 단조성 검증 완료");
 
     // ------------------------------------------------------------------------
-    // 반응형 레이아웃 (1280px 데스크톱 & 375px 모바일) + Uncaught Error 0건
+    // 반응형 레이아웃 (1280px 데스크톱 & 5종 스마트폰 360~430px) + 터치 스크러빙 + 상대경로 API_BASE + 에러 0건
     // ------------------------------------------------------------------------
     const desktopMetrics = await cdp.eval(`(() => {
-      const panel = document.getElementById('attributionPanel').getBoundingClientRect();
-      const banner = document.getElementById('chartHoverBanner').getBoundingClientRect();
-      const tabs = document.getElementById('assetsTablePeriodTabs').getBoundingClientRect();
+      const box = (el) => {
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { width: r.width, height: r.height, left: r.left, right: r.right };
+      };
       return {
         scrollW: document.documentElement.scrollWidth,
         innerW: window.innerWidth,
-        panelRight: panel.right,
-        bannerRight: banner.right,
-        tabsRight: tabs.right
+        container: box(document.querySelector('.container')),
+        panel: box(document.getElementById('attributionPanel')),
+        banner: box(document.getElementById('chartHoverBanner')),
+        tabs: box(document.getElementById('assetsTablePeriodTabs'))
       };
     })()`);
     assert(desktopMetrics.scrollW <= desktopMetrics.innerW, `Desktop 1280px horizontal overflow: ${desktopMetrics.scrollW} > ${desktopMetrics.innerW}`);
-    assert(desktopMetrics.panelRight <= 1281 && desktopMetrics.bannerRight <= 1281 && desktopMetrics.tabsRight <= 1281);
+    for (const [k, rect] of Object.entries({ container: desktopMetrics.container, panel: desktopMetrics.panel, banner: desktopMetrics.banner, tabs: desktopMetrics.tabs })) {
+      assert(rect && rect.width > 0 && rect.height > 0, `Desktop 1280px missing ${k}`);
+      assert(rect.left >= -1 && rect.right <= 1281, `Desktop 1280px ${k} out of bounds: ${JSON.stringify(rect)}`);
+    }
 
+    await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+
+    const mobileSummaryLogs = [];
+    for (const vp of MOBILE_VIEWPORTS) {
+      await cdp.send("Emulation.setDeviceMetricsOverride", {
+        width: vp.width,
+        height: vp.height,
+        deviceScaleFactor: vp.deviceScaleFactor,
+        mobile: true
+      });
+      await cdp.eval(`(() => {
+        window.scrollTo(0, 0);
+        const body = document.getElementById('attrPanelBody');
+        if (body && getComputedStyle(body).display === 'none') {
+          document.getElementById('attrCollapseBtn')?.click();
+        }
+        window.dispatchEvent(new Event('resize'));
+        renderYtdSvgChart();
+        renderAttributionPanel();
+      })()`);
+      await new Promise(r => setTimeout(r, 250));
+
+      const mobileMetrics = await cdp.eval(`(() => {
+        const box = (el) => {
+          if (!el) return null;
+          const r = el.getBoundingClientRect();
+          return { width: r.width, height: r.height, left: r.left, right: r.right };
+        };
+        return {
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+          container: box(document.querySelector('.container')),
+          panel: box(document.getElementById('attributionPanel')),
+          banner: box(document.getElementById('chartHoverBanner')),
+          tabs: box(document.getElementById('assetsTablePeriodTabs')),
+          fab: box(document.querySelector('.fab-bar, .floating-bar')),
+          dRows: document.querySelectorAll('#attrDraggersList .attr-mover-row').length,
+          lRows: document.querySelectorAll('#attrLeadersList .attr-mover-row').length,
+          dBars: document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length,
+          lBars: document.querySelectorAll('#attrLeadersList .attr-mover-row .attr-bar-track').length,
+          fBars: document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length
+        };
+      })()`);
+
+      assert.strictEqual(mobileMetrics.innerW, vp.width, `Mobile ${vp.label} innerWidth mismatch`);
+      assert(mobileMetrics.scrollW <= mobileMetrics.innerW, `Mobile ${vp.label} horizontal overflow: ${mobileMetrics.scrollW} > ${mobileMetrics.innerW}`);
+      for (const [k, rect] of Object.entries({
+        container: mobileMetrics.container,
+        panel: mobileMetrics.panel,
+        banner: mobileMetrics.banner,
+        tabs: mobileMetrics.tabs,
+        fab: mobileMetrics.fab
+      })) {
+        assert(rect && rect.width > 0 && rect.height > 0, `Mobile ${vp.label} missing/empty ${k}: ${JSON.stringify(rect)}`);
+        assert(rect.left >= -1, `Mobile ${vp.label} ${k} left clipped: ${JSON.stringify(rect)}`);
+        assert(rect.right <= vp.width + 1, `Mobile ${vp.label} ${k} right overflow (${rect.right} > ${vp.width + 1}): ${JSON.stringify(rect)}`);
+      }
+      assert(
+        mobileMetrics.container.width >= vp.width - 2,
+        `Mobile ${vp.label} .container not expanded to mobile width: width=${mobileMetrics.container.width}, vp=${vp.width}`
+      );
+      if (vp.width >= 390) {
+        assert(
+          mobileMetrics.container.width > 382,
+          `Mobile ${vp.label} .container trapped <= 382px: width=${mobileMetrics.container.width}`
+        );
+      }
+      assert(mobileMetrics.dRows > 0 && mobileMetrics.lRows > 0, `Mobile ${vp.label} expected non-empty mover rows, got ${JSON.stringify(mobileMetrics)}`);
+      assert.strictEqual(mobileMetrics.dBars, 0, `Mobile ${vp.label} #attrDraggersList .attr-bar-track count != 0`);
+      assert.strictEqual(mobileMetrics.lBars, 0, `Mobile ${vp.label} #attrLeadersList .attr-bar-track count != 0`);
+      assert.strictEqual(mobileMetrics.fBars, 6, `Mobile ${vp.label} #attrFactorsGrid .attr-bar-track count != 6`);
+
+      const mobileShadeRes = await verifyDeltaShadeMonotonicity(cdp, {
+        periods: [...TRADING_PERIODS, "1D"],
+        expectedWidthPx: vp.expectedMoverWidthPx,
+        viewportLabel: `Mobile-${vp.label}`
+      });
+
+      const line = `${vp.label}(scrollW=${mobileMetrics.scrollW}/${mobileMetrics.innerW}, .container=${mobileMetrics.container.width.toFixed(1)}px, moverW=${vp.expectedMoverWidthPx}px, 음영=${mobileShadeRes.checkedLists}리스트/${mobileShadeRes.checkedRows}행)`;
+      mobileSummaryLogs.push(line);
+      console.log(`  -> PASS [모바일 ${vp.label}]: ${line}, #attributionPanel/#chartHoverBanner/#assetsTablePeriodTabs/.fab-bar 우측 경계 안전`);
+    }
+
+    // ------------------------------------------------------------------------
+    // 모바일(390x844) 차트 터치 스크러빙 + 기간 칩·원장 탭 전환 검증
+    // ------------------------------------------------------------------------
     await cdp.send("Emulation.setDeviceMetricsOverride", {
-      width: 375,
-      height: 812,
-      deviceScaleFactor: 2,
+      width: 390,
+      height: 844,
+      deviceScaleFactor: 3,
       mobile: true
     });
     await cdp.eval(`(() => {
+      const penCb = document.getElementById('includePensionCheckbox');
+      const riskCb = document.getElementById('onlyRiskAssetsCheckbox');
+      if (!penCb.checked) penCb.click();
+      if (riskCb.checked) riskCb.click();
       window.dispatchEvent(new Event('resize'));
       renderYtdSvgChart();
       renderAttributionPanel();
     })()`);
     await new Promise(r => setTimeout(r, 250));
 
-    const mobileMetrics = await cdp.eval(`(() => {
-      const panel = document.getElementById('attributionPanel').getBoundingClientRect();
-      const banner = document.getElementById('chartHoverBanner').getBoundingClientRect();
-      const tabs = document.getElementById('assetsTablePeriodTabs').getBoundingClientRect();
+    const touchSetup = await cdp.eval(`(() => {
+      const overlay = document.getElementById('chartOverlayRect');
+      const svg = document.getElementById('ytdSvgChart');
+      overlay.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const rect = overlay.getBoundingClientRect();
+      const src = (fullHistoryData && fullHistoryData.length > 0) ? fullHistoryData : ytdHistoryData;
+      const filtered = src.filter(p => p.date >= '2026-01-02');
+      const idx12 = filtered.findIndex(p => p.date === '2026-11-12');
+      const idx13 = filtered.findIndex(p => p.date === '2026-11-13');
+      const idx14 = filtered.findIndex(p => p.date === '2026-11-14');
+      const W = Math.max(320, Math.round(document.getElementById('svgChartWrap').clientWidth || 960));
+      const isMobileView = (W <= 480) || (window.innerWidth <= 480);
+      const padXLeft = isMobileView ? 36 : 45;
+      const padXRight = isMobileView ? 14 : 45;
+      const chartW = W - padXLeft - padXRight;
+      const toClientX = (idx) => {
+        const svgX = padXLeft + (idx / (filtered.length - 1)) * chartW;
+        return rect.left + (svgX / W) * rect.width;
+      };
+      const clientY = rect.top + rect.height * 0.5;
+      const idxStart = Math.max(0, idx12 - 60);
+      const xStart = toClientX(idxStart);
+      const x12 = toClientX(idx12);
+      const x13 = toClientX(idx13);
+      const x14 = toClientX(idx14);
+      const hitAt = (x) => {
+        const el = document.elementFromPoint(x, clientY);
+        return el ? (el.id || el.tagName) : '';
+      };
       return {
-        scrollW: document.documentElement.scrollWidth,
-        innerW: window.innerWidth,
-        panelRight: panel.right,
-        bannerRight: banner.right,
-        tabsRight: tabs.right,
-        dRows: document.querySelectorAll('#attrDraggersList .attr-mover-row').length,
-        lRows: document.querySelectorAll('#attrLeadersList .attr-mover-row').length,
-        dBars: document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length,
-        lBars: document.querySelectorAll('#attrLeadersList .attr-mover-row .attr-bar-track').length,
-        fBars: document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length
+        overlayTouchAction: getComputedStyle(overlay).touchAction,
+        svgTouchAction: getComputedStyle(svg).touchAction,
+        rectTop: rect.top,
+        rectBottom: rect.bottom,
+        innerH: window.innerHeight,
+        idxStart,
+        startDate: filtered[idxStart] ? filtered[idxStart].date : '',
+        idx12,
+        idx13,
+        idx14,
+        clientY,
+        xStart,
+        x12,
+        x13,
+        x14,
+        hitStart: hitAt(xStart),
+        hit12: hitAt(x12),
+        hit13: hitAt(x13),
+        hit14: hitAt(x14)
       };
     })()`);
-    assert(mobileMetrics.scrollW <= mobileMetrics.innerW, `Mobile 375px horizontal overflow: ${mobileMetrics.scrollW} > ${mobileMetrics.innerW}`);
-    assert(mobileMetrics.panelRight <= 376 && mobileMetrics.bannerRight <= 376 && mobileMetrics.tabsRight <= 376);
-    assert(mobileMetrics.dRows > 0 && mobileMetrics.lRows > 0, `Mobile 375px expected non-empty mover rows, got ${JSON.stringify(mobileMetrics)}`);
-    assert.strictEqual(mobileMetrics.dBars, 0, `Mobile 375px #attrDraggersList .attr-mover-row .attr-bar-track count != 0`);
-    assert.strictEqual(mobileMetrics.lBars, 0, `Mobile 375px #attrLeadersList .attr-mover-row .attr-bar-track count != 0`);
-    assert.strictEqual(mobileMetrics.fBars, 6, `Mobile 375px #attrFactorsGrid .attr-factor-card .attr-bar-track count != 6`);
+    assert.strictEqual(touchSetup.overlayTouchAction, "pan-y", `#chartOverlayRect touch-action mismatch: ${touchSetup.overlayTouchAction}`);
+    assert.strictEqual(touchSetup.svgTouchAction, "pan-y", `#ytdSvgChart touch-action mismatch: ${touchSetup.svgTouchAction}`);
+    assert(touchSetup.idx12 >= 0 && touchSetup.idx13 >= 0 && touchSetup.idx14 >= 0, "Missing 2026-11-12/13/14 points on mobile chart");
+    assert(touchSetup.x12 - touchSetup.xStart >= 40, `Touch scrub drag distance too short for touch slop: ${touchSetup.x12 - touchSetup.xStart}px`);
+    assert(touchSetup.rectTop >= 0 && touchSetup.rectBottom <= touchSetup.innerH, `Mobile overlay offscreen after scrollIntoView: ${JSON.stringify(touchSetup)}`);
+    assert(touchSetup.hitStart === "chartOverlayRect" && touchSetup.hit12 === "chartOverlayRect" && touchSetup.hit13 === "chartOverlayRect" && touchSetup.hit14 === "chartOverlayRect", `Mobile chart hit targets unexpected: ${JSON.stringify(touchSetup)}`);
 
-    // 375px 모바일 Top 5 금액 칸 비례 음영(.attr-delta-shade) 검증 (142px 통일·투명배경·단조감소·공식·우측축 정렬)
-    const mobileShadeRes = await verifyDeltaShadeMonotonicity(cdp, {
-      periods: [...TRADING_PERIODS, "1D"],
-      expectedWidthPx: 142,
-      viewportLabel: "Mobile-375px"
+    const readMobileHoverState = async () => cdp.eval(`(() => ({
+      date: document.getElementById('hoverDate').innerText,
+      rowText: document.getElementById('hoverMoversRow').innerText,
+      chipsUp: document.querySelectorAll('#hoverMoversRow .hover-mover-chip.up').length,
+      chipsDown: document.querySelectorAll('#hoverMoversRow .hover-mover-chip.down').length,
+      hasFlat: !!document.querySelector('#hoverMoversRow .hover-mover-flat'),
+      lineDisp: document.getElementById('chartHoverLine').style.display,
+      dotDisp: document.getElementById('chartHoverDot').style.display,
+      lineX1: parseFloat(document.getElementById('chartHoverLine').getAttribute('x1') || 'NaN'),
+      dotCx: parseFloat(document.getElementById('chartHoverDot').getAttribute('cx') || 'NaN')
+    }))()`);
+
+    // 실제 모바일 브라우저(DevTools 모바일 에뮬레이션 포함)는 ontouchstart 프로퍼티가 아닌
+    // touchstart/touchmove 이벤트 리스너 또는 표준 터치 이벤트를 수신해야 함
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: [{ x: touchSetup.xStart, y: touchSetup.clientY, radiusX: 4, radiusY: 4, force: 1, id: 1 }]
     });
+    await new Promise(r => setTimeout(r, 60));
+    const touchStartState = await readMobileHoverState();
+    assert.strictEqual(touchStartState.date, touchSetup.startDate, `Mobile touchStart date mismatch: ${touchStartState.date} (expected ${touchSetup.startDate})`);
+    assert.strictEqual(touchStartState.lineDisp, "block");
+    assert.strictEqual(touchStartState.dotDisp, "block");
+
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: touchSetup.x12, y: touchSetup.clientY, radiusX: 4, radiusY: 4, force: 1, id: 1 }]
+    });
+    await new Promise(r => setTimeout(r, 60));
+    const touch12 = await readMobileHoverState();
+    assert.strictEqual(touch12.date, "2026-11-12", `Mobile touchMove 12 date mismatch: ${touch12.date}`);
+    assert.strictEqual(touch12.lineDisp, "block");
+    assert.strictEqual(touch12.dotDisp, "block");
+    assert(touch12.rowText.includes("상승 Top 2") && touch12.rowText.includes("하락 Top 2"), `Mobile touch 2026-11-12 missing Top 2 movers: ${touch12.rowText}`);
+
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: touchSetup.x13, y: touchSetup.clientY, radiusX: 4, radiusY: 4, force: 1, id: 1 }]
+    });
+    await new Promise(r => setTimeout(r, 60));
+    const touch13 = await readMobileHoverState();
+    assert.strictEqual(touch13.date, "2026-11-13", `Mobile touchMove 13 date mismatch: ${touch13.date}`);
+    assert.strictEqual(touch13.lineDisp, "block");
+    assert.strictEqual(touch13.dotDisp, "block");
+    assert(touch13.lineX1 > touch12.lineX1 && touch13.dotCx > touch12.dotCx, "Hover line/dot did not advance horizontally on touchMove 12->13");
+    assert(touch13.rowText.includes("상승 Top 2") && touch13.rowText.includes("하락 Top 2"), `Mobile touch 2026-11-13 missing Top 2 movers: ${touch13.rowText}`);
+    assert(touch13.chipsUp >= 1 && touch13.chipsDown >= 1, `Mobile touch 2026-11-13 missing chips: ${JSON.stringify(touch13)}`);
+    assert(!touch13.rowText.includes("KODEX 반도체레버리지"), "Sold AST-037 must not appear on mobile touch 2026-11-13");
+
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchMove",
+      touchPoints: [{ x: touchSetup.x14, y: touchSetup.clientY, radiusX: 4, radiusY: 4, force: 1, id: 1 }]
+    });
+    await new Promise(r => setTimeout(r, 60));
+    const touch14 = await readMobileHoverState();
+    assert.strictEqual(touch14.date, "2026-11-14", `Mobile touchMove 14 date mismatch: ${touch14.date}`);
+    assert.strictEqual(touch14.lineDisp, "block");
+    assert.strictEqual(touch14.dotDisp, "block");
+    assert(touch14.lineX1 > touch13.lineX1 && touch14.dotCx > touch13.dotCx, "Hover line/dot did not advance horizontally on touchMove 13->14");
+    assert(touch14.hasFlat && touch14.rowText.includes("휴장일"), `Mobile touch 2026-11-14 expected 휴장일: ${touch14.rowText}`);
+
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: []
+    });
+    await new Promise(r => setTimeout(r, 80));
+
+    // 모바일(390x844) 기간 수익률 칩 클릭 및 원장 테이블 기간 탭 전환 검증
+    for (const p of ["1D", "1W", "1M", "peak_drawdown", "YTD", "trough_gain"]) {
+      const mChipRes = await cdp.eval(`(() => {
+        const chip = document.querySelector('#periodReturnsStrip .period-chip[data-period="${p}"]');
+        if (!chip) return { error: 'Missing mobile chip ${p}' };
+        chip.click();
+        return {
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+          activePills: Array.from(document.querySelectorAll('#attrPeriodPills .attr-period-pill.active')).map(e => e.getAttribute('data-period')),
+          activeChips: Array.from(document.querySelectorAll('#periodReturnsStrip .period-chip.attr-active')).map(e => e.getAttribute('data-period')),
+          dBars: document.querySelectorAll('#attrDraggersList .attr-mover-row .attr-bar-track').length,
+          fBars: document.querySelectorAll('#attrFactorsGrid .attr-factor-card .attr-bar-track').length
+        };
+      })()`);
+      assert(!mChipRes.error, mChipRes.error);
+      assert(mChipRes.scrollW <= mChipRes.innerW, `Mobile 390x844 overflow after chip ${p}`);
+      assert.deepStrictEqual(mChipRes.activePills, [p]);
+      assert(mChipRes.activeChips.length === 2 && mChipRes.activeChips.every(x => x === p));
+      assert.strictEqual(mChipRes.dBars, 0);
+      assert.strictEqual(mChipRes.fBars, 6);
+    }
+
+    for (const [term, [profitHdr, retHdr]] of Object.entries(EXPECTED_TABLE_HEADERS)) {
+      const mTabRes = await cdp.eval(`(() => {
+        const btn = document.querySelector('#assetsTablePeriodTabs .table-period-btn[data-term="${term}"]');
+        if (!btn) return { error: 'Missing mobile tab ${term}' };
+        btn.click();
+        return {
+          scrollW: document.documentElement.scrollWidth,
+          innerW: window.innerWidth,
+          active: btn.classList.contains('active'),
+          profitHdr: document.getElementById('thProfitLabel').innerText,
+          retHdr: document.getElementById('thReturnLabel').innerText,
+          rows: document.querySelectorAll('#assetsTableBody tr').length
+        };
+      })()`);
+      assert(!mTabRes.error, mTabRes.error);
+      assert(mTabRes.scrollW <= mTabRes.innerW, `Mobile 390x844 overflow after tab ${term}`);
+      assert(mTabRes.active);
+      assert.strictEqual(mTabRes.profitHdr, profitHdr);
+      assert.strictEqual(mTabRes.retHdr, retHdr);
+      assert.strictEqual(mTabRes.rows, 61);
+    }
+
     console.log(
-      `  -> PASS [T-28-11 모바일 음영]: 375px (${mobileShadeRes.checkedLists}리스트/${mobileShadeRes.checkedRows}행) 폭 142px 통일·투명배경·단조감소·공식·우측축 정렬 확인`
+      `  -> PASS [모바일 터치/컨트롤]: 390x844 touchStart(2026-11-12 Top2) -> touchMove(2026-11-13 Top2·lineX=${touch13.lineX1.toFixed(1)}, dotCx=${touch13.dotCx.toFixed(1)}) -> touchMove(2026-11-14 휴장일), 기간칩 6종·원장탭 7종 전환 오류 0건`
+    );
+
+    // ------------------------------------------------------------------------
+    // 외부 접속 상대경로 API_BASE === '' 실제 네트워크 호출 검증 (/api/attribution, /api/prices, /api/history)
+    // ------------------------------------------------------------------------
+    const netCheckStartIdx = cdp.events.length;
+    const originState = await cdp.eval(`({
+      origin: window.location.origin,
+      apiBase: API_BASE
+    })`);
+    assert.strictEqual(originState.origin, isolatedServer.baseUrl);
+    assert.strictEqual(originState.apiBase, "");
+
+    await cdp.eval(`document.getElementById('btnUpdatePrices').click();`);
+    await waitUntil(async () => {
+      const doneBtn = await cdp.eval(`!document.getElementById('btnUpdatePrices').disabled`);
+      if (!doneBtn) return false;
+      const recentResponses = cdp.events.slice(netCheckStartIdx)
+        .filter(e => e.method === "Network.responseReceived" && e.params && e.params.response)
+        .map(e => ({ url: e.params.response.url, status: e.params.response.status }));
+      const hasPrices = recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/prices` && r.status === 200);
+      const hasHistory = recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/history` && r.status === 200);
+      const hasAttrRefresh = recentResponses.some(r => r.url.startsWith(`${isolatedServer.baseUrl}/api/attribution?refresh=1`) && r.status === 200);
+      return hasPrices && hasHistory && hasAttrRefresh;
+    }, 25000, "relative-path /api/prices + /api/history + /api/attribution?refresh=1 completion");
+
+    const allRequests = cdp.events
+      .filter(e => e.method === "Network.requestWillBeSent" && e.params && e.params.request)
+      .map(e => e.params.request.url);
+    const allResponses = cdp.events
+      .filter(e => e.method === "Network.responseReceived" && e.params && e.params.response)
+      .map(e => ({ url: e.params.response.url, status: e.params.response.status }));
+    const failedLocalReqs = cdp.events
+      .filter(e => e.method === "Network.loadingFailed" && e.params)
+      .filter(e => {
+        const reqEv = cdp.events.find(x => x.method === "Network.requestWillBeSent" && x.params && x.params.requestId === e.params.requestId);
+        return reqEv && reqEv.params && reqEv.params.request && reqEv.params.request.url.startsWith(isolatedServer.baseUrl);
+      });
+
+    const apiUrls = allRequests.filter(u => u.includes("/api/"));
+    assert(apiUrls.length > 0, "Expected /api/* network requests");
+    for (const u of apiUrls) {
+      assert(!u.includes(":8765"), `Hardcoded port 8765 leak detected in browser request: ${u}`);
+      assert(u.startsWith(`${isolatedServer.baseUrl}/api/`), `API request must use same-origin relative path (${isolatedServer.baseUrl}), got: ${u}`);
+    }
+    for (const ep of ["/api/attribution", "/api/prices", "/api/history", "/api/transactions"]) {
+      assert(
+        allResponses.some(r => r.url.startsWith(`${isolatedServer.baseUrl}${ep}`) && r.status === 200),
+        `Missing HTTP 200 response for same-origin ${ep}`
+      );
+    }
+    const badLocalResponses = allResponses.filter(r => r.url.startsWith(isolatedServer.baseUrl) && r.status >= 400);
+    assert.strictEqual(badLocalResponses.length, 0, `HTTP >= 400 responses on isolated origin: ${JSON.stringify(badLocalResponses)}`);
+    assert.strictEqual(failedLocalReqs.length, 0, `Network.loadingFailed on isolated origin: ${JSON.stringify(failedLocalReqs)}`);
+    console.log(
+      `  -> PASS [상대경로 API_BASE]: API_BASE==="", 포트 8765 하드코딩 요청 0건, 동일 오리진(${isolatedServer.baseUrl}) /api/attribution·/api/prices·/api/history·/api/transactions 200 OK 확인`
     );
 
     const exceptions = cdp.events.filter(e => e.method === "Runtime.exceptionThrown");
@@ -1207,14 +1611,14 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     assert.strictEqual(consoleErrors.length, 0, `Console errors: ${JSON.stringify(consoleErrors)}`);
     assert.strictEqual(logErrors.length, 0, `Browser log errors: ${JSON.stringify(logErrors)}`);
 
-    console.log(`  -> PASS [반응형/에러]: 1280px(scrollW=${desktopMetrics.scrollW}/${desktopMetrics.innerW}) & 375px(scrollW=${mobileMetrics.scrollW}/${mobileMetrics.innerW}) overflow 0건, uncaught/console error 0건`);
+    console.log(`  -> PASS [전체 뷰포트·에러 요약]: 1280px(scrollW=${desktopMetrics.scrollW}/${desktopMetrics.innerW}) & 5종 모바일 [${mobileSummaryLogs.join(" | ")}], console/page error 0건`);
   } finally {
     if (cdp) cdp.close();
     if (proc && proc.exitCode === null) {
       proc.kill("SIGKILL");
       await new Promise(r => setTimeout(r, 200));
     }
-    await new Promise(r => server.close(r));
+    await isolatedServer.stop();
     try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (_) {}
   }
 }

@@ -154,12 +154,31 @@ def _load_json(filename):
 class TestAttributionQA(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls._backup_files = {}
+        for fname in ("attribution_cache.json", "asset_history.json"):
+            fpath = os.path.join(DATA_DIR, fname)
+            if os.path.exists(fpath):
+                with open(fpath, "rb") as f:
+                    cls._backup_files[fpath] = f.read()
         cls.assets = _load_json("assets_v3.json")
         cls.transactions = _load_json("transactions.json")
         cls.calc_cache = _load_json("calculated_history_cache.json")
         cls.asset_history = _load_json("asset_history.json")
         cls.ticker_cache = _load_json("ticker_history_cache.json")
         cls.attr_cache = _load_json("attribution_cache.json")
+
+    @classmethod
+    def tearDownClass(cls):
+        for fpath, raw_bytes in getattr(cls, "_backup_files", {}).items():
+            current = None
+            if os.path.exists(fpath):
+                with open(fpath, "rb") as f:
+                    current = f.read()
+            if current != raw_bytes:
+                tmp_path = fpath + ".qa_restore.tmp"
+                with open(tmp_path, "wb") as f:
+                    f.write(raw_bytes)
+                os.replace(tmp_path, fpath)
 
     def test_01_ticker_cache_and_coverage(self):
         """1. ticker_history_cache.json (GOLD-KRX 300+일, 47종[46활성+494310] 100% 커버리지) 및 FX 검증"""
@@ -443,7 +462,7 @@ class TestAttributionQA(unittest.TestCase):
         self.assertEqual(checked, 36)
 
         base_nav_by_sc = _build_hybrid_nav_by_scenario(
-            self.calc_cache, self.asset_history, as_of, None, self.assets
+            self.calc_cache, self.asset_history, as_of, None, self.assets, clip_to_today=True
         )
         for sc in BASE_SCENARIO_COUNTS:
             sc_obj = ac["scenarios"][sc]
@@ -474,6 +493,7 @@ class TestAttributionQA(unittest.TestCase):
             live_market_data=None,
             allow_network=False,
             save_cache=False,
+            as_of_date=as_of,
         )
         self._assert_payload_invariants(rebuilt, expected_counts)
         for sc in BASE_SCENARIO_COUNTS:
