@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); const d = JSON.parse(fs.readFileSync('data/domino_review/finance_261103.json', 'utf8')); console.log(JSON.stringify(d.headers, null, 2)); console.log(JSON.stringify(d.rows[0], null, 2));

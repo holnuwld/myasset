@@ -1,0 +1,50 @@
+{
+  "timestamp": "2026-11-05T21:34:55.590765",
+  "today_nav": 1080226342,
+  "total_buy": 840561600.0,
+  "real_period_returns": {
+    "1D": {
+      "past_nav": 1074435815,
+      "return_pct": 0.54
+    },
+    "1W": {
+      "past_nav": 1129154433,
+      "return_pct": -4.33
+    },
+    "1M": {
+      "past_nav": 1220600671,
+      "return_pct": -11.5
+    },
+    "3M": {
+      "past_nav": 1126791901,
+      "return_pct": -4.13
+    },
+    "6M": {
+      "past_nav": 1311596173,
+      "return_pct": -17.64
+    },
+    "YTD": {
+      "past_nav": 931860125,
+      "return_pct": 15.92
+    },
+    "1Y": {
+      "past_nav": 905120859,
+      "return_pct": 19.35
+    }
+  },
+  "server_period_returns": {
+    "1D": -3.76,
+    "1W": -5.91,
+    "1M": -14.64,
+    "3M": -7.49,
+    "6M": -20.67,
+    "YTD": 11.66,
+    "1Y": 16.14
+  },
+  "defects": {
+    "defect_A": false,
+    "defect_B": false,
+    "defect_C": false,
+    "defect_D": false
+  }
+}

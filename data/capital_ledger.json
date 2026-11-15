@@ -1,0 +1,15 @@
+{
+  "baseline_date": "2026-11-03",
+  "baseline_capital": {
+    "total": 840561600,
+    "no_pension": 768469326,
+    "pension": 72092274
+  },
+  "inflows": [],
+  "cumulative_capital": {
+    "total": 840561600,
+    "no_pension": 768469326,
+    "pension": 72092274,
+    "last_updated": "2026-11-03 00:00:00"
+  }
+}

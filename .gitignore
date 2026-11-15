@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.tmp
+tests/temp_profile/
+.env
+.telegram_token
+data/test_tmp*.json
+data/test_tg_*.txt

@@ -1,0 +1,31 @@
+[
+  {
+    "id": "AST-046",
+    "category": "해외주식",
+    "institution": "키움증권",
+    "account_name": "위탁종합 (해외)",
+    "account_num": "5318-4517",
+    "asset_type": "해외주식",
+    "name": "ITOCHU CORP (이토추상사, 8001)",
+    "ticker": "8001.T",
+    "maturity_date": null,
+    "interest_rate": null,
+    "currency": "JPY",
+    "quantity": 500.0,
+    "buy_price": 1889.4,
+    "current_price": 2271.0,
+    "valuation_origin": 1135500.0,
+    "profit_origin": 189343.86,
+    "return_rate": 20.04,
+    "buy_krw": 8012851.0,
+    "valuation_krw": 9631197.0,
+    "profit_krw": 1605996.0,
+    "tags": [
+      "해외주식",
+      "일본주식",
+      "종합상사",
+      "버핏투자",
+      "JPY"
+    ]
+  }
+]
