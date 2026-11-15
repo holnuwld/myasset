@@ -68,6 +68,26 @@ try:
 except ImportError:
     from src.auto_backfill import run_auto_backfill
 
+# Attribution Engine Module
+try:
+    from attribution_engine import (
+        build_attribution_payload,
+        load_attribution_cache,
+        normalize_scenario,
+        PERIOD_ORDER as ATTR_PERIOD_ORDER,
+        PERIOD_LABELS as ATTR_PERIOD_LABELS,
+        SCENARIO_DEFS as ATTR_SCENARIO_DEFS,
+    )
+except ImportError:
+    from src.attribution_engine import (
+        build_attribution_payload,
+        load_attribution_cache,
+        normalize_scenario,
+        PERIOD_ORDER as ATTR_PERIOD_ORDER,
+        PERIOD_LABELS as ATTR_PERIOD_LABELS,
+        SCENARIO_DEFS as ATTR_SCENARIO_DEFS,
+    )
+
 # Auto-Backfill Status Cache
 _backfill_status = {
     "status": "pending",
@@ -91,7 +111,9 @@ if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
         pass
 
 HOST = "0.0.0.0"
-PORT = 8765
+PORT = int(os.environ.get("PORT", "8765"))
+DISABLE_TG_POLL = os.environ.get("DISABLE_TG_POLL", "0").strip().lower() in ("1", "true", "yes")
+NO_BROWSER = os.environ.get("NO_BROWSER", "0").strip().lower() in ("1", "true", "yes")
 KST = timezone(timedelta(hours=9))
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WEB_DIR = os.path.join(BASE_DIR, "web")
@@ -99,6 +121,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 HISTORY_FILE = os.path.join(DATA_DIR, "asset_history.json")
 ASSETS_FILE = os.path.join(DATA_DIR, "assets_v3.json")
 CALCULATED_CACHE_FILE = os.path.join(DATA_DIR, "calculated_history_cache.json")
+ATTRIBUTION_CACHE_FILE = os.path.join(DATA_DIR, "attribution_cache.json")
 
 # 대상 티커 목록
 DOMESTIC_TICKERS = [
@@ -128,6 +151,71 @@ _history_cache = {
     "timestamp": None,
     "data": None
 }
+
+# 기여도 분석 캐시
+_attribution_cache = {
+    "timestamp": None,
+    "data": None
+}
+ATTRIBUTION_CACHE_TTL_SECONDS = 300
+
+
+def _invalidate_attribution_cache():
+    _attribution_cache["timestamp"] = None
+    _attribution_cache["data"] = None
+
+
+def get_attribution_data(force_refresh=False, refresh_tickers=False, live_assets=None, live_market_data=None):
+    """
+    기여도 분석 캐시 반환/재계산 (TTL 300초, refresh=1 시 즉시 재계산)
+    """
+    now = datetime.now(KST)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if not force_refresh and _attribution_cache["data"] and _attribution_cache["timestamp"]:
+        age = (now - _attribution_cache["timestamp"]).total_seconds()
+        if age < ATTRIBUTION_CACHE_TTL_SECONDS and _attribution_cache["data"].get("as_of") == today_str:
+            return _attribution_cache["data"]
+
+    if not force_refresh and os.path.exists(ATTRIBUTION_CACHE_FILE):
+        try:
+            cached = load_attribution_cache(ATTRIBUTION_CACHE_FILE)
+            if cached and cached.get("as_of") == today_str and cached.get("scenarios"):
+                updated_iso = cached.get("updated_at")
+                use_disk = False
+                if updated_iso:
+                    try:
+                        upd_dt = datetime.fromisoformat(updated_iso)
+                        if (now - upd_dt).total_seconds() < ATTRIBUTION_CACHE_TTL_SECONDS:
+                            use_disk = True
+                    except Exception:
+                        pass
+                if use_disk:
+                    _attribution_cache["timestamp"] = now
+                    _attribution_cache["data"] = cached
+                    return cached
+        except Exception:
+            pass
+
+    if refresh_tickers and live_market_data is None:
+        try:
+            live_market_data = fetch_all_market_data(force_refresh=True)
+        except Exception:
+            live_market_data = _cache.get("data")
+    elif live_market_data is None and _cache.get("data"):
+        live_market_data = _cache["data"]
+
+    payload = build_attribution_payload(
+        assets=live_assets,
+        live_market_data=live_market_data,
+        force_refresh_tickers=refresh_tickers,
+        allow_network=bool(refresh_tickers or force_refresh),
+        save_cache=True,
+        attribution_cache_file=ATTRIBUTION_CACHE_FILE,
+    )
+    _attribution_cache["timestamp"] = now
+    _attribution_cache["data"] = payload
+    return payload
 
 
 def get_server_ips():
@@ -399,6 +487,8 @@ def fetch_all_market_data(force_refresh=False):
 
     _cache["timestamp"] = now
     _cache["data"] = payload
+    if force_refresh:
+        _invalidate_attribution_cache()
 
     # 일별 실자산 스냅샷 자동 저장 (4대 시나리오 기록)
     try:
@@ -726,7 +816,7 @@ TELEGRAM_CHAT_ID = "770409615"
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 _telegram_status = {
-    "status": "connected",
+    "status": "polling_disabled" if DISABLE_TG_POLL else "connected",
     "bot": "@sjstck_bot",
     "chat_id": TELEGRAM_CHAT_ID,
     "last_polled": None,
@@ -1161,6 +1251,334 @@ def get_maturity_alerts(assets):
     return urgent_items, future_items
 
 
+_ATTR_PERIOD_ALIASES = {
+    "1d": "1D", "오늘": "1D", "일간": "1D", "전일": "1D", "당일": "1D",
+    "1w": "1W", "1주": "1W", "주간": "1W", "최근1주": "1W", "일주일": "1W",
+    "1m": "1M", "1개월": "1M", "월간": "1M", "한달": "1M", "한달간": "1M",
+    "3m": "3M", "3개월": "3M", "분기": "3M",
+    "6m": "6M", "6개월": "6M", "반기": "6M",
+    "ytd": "YTD", "연초": "YTD", "올해": "YTD", "연중": "YTD",
+    "1y": "1Y", "1년": "1Y", "년간": "1Y", "연간": "1Y",
+    "고점": "peak_drawdown", "고점대비": "peak_drawdown", "mdd": "peak_drawdown",
+    "peak": "peak_drawdown", "최고점": "peak_drawdown",
+    "저점": "trough_gain", "저점대비": "trough_gain", "반등": "trough_gain",
+    "trough": "trough_gain", "최저점": "trough_gain",
+}
+
+
+def _short_attr_name(name: str, max_len: int = 13) -> str:
+    s = str(name or "").strip()
+    if len(s) > max_len:
+        return s[:max_len - 1] + "…"
+    return s
+
+
+def _fmt_mmdd(d_str: str) -> str:
+    if not d_str or len(d_str) < 10:
+        return d_str or "-"
+    return f"{d_str[5:7]}/{d_str[8:10]}"
+
+
+def _fmt_contrib(item: dict, near_flat: bool) -> str:
+    if near_flat:
+        return f"기여 {item.get('contrib_pp', 0.0):+.2f}%p"
+    return f"기여 {item.get('contrib_pct', 0.0):+.1f}%"
+
+
+def _build_rollover_notice(trades: list) -> str:
+    if not trades:
+        return ""
+    rollovers = [t for t in trades if t.get("is_internal_rollover")]
+    chosen = rollovers if rollovers else trades
+    seen = set()
+    parts = []
+    for t in chosen:
+        mmdd = _fmt_mmdd(t.get("date", ""))
+        raw_name = str(t.get("asset_name", "") or "").strip()
+        clean_name = re.sub(r"\s*\([^)]*\).*", "", raw_name).strip() or raw_name
+        aname = _short_attr_name(clean_name, 14)
+        key = f"{mmdd} {aname}"
+        if key not in seen:
+            seen.add(key)
+            parts.append(key)
+        if len(parts) >= 2:
+            break
+    extra = f" 등 총 {len(chosen)}건" if len(chosen) > len(parts) else ""
+    joined = " · ".join(html.escape(p) for p in parts)
+    if rollovers:
+        return f"ℹ️ <i>기간 내 내부 이체·롤오버({joined}{extra})는 시세 급등락에서 제외됨</i>"
+    return f"ℹ️ <i>기간 내 매매({joined}{extra})는 일정 수량 기준에서 분리 반영됨</i>"
+
+
+def format_attribution_telegram(tokens: list, refresh_banner: str, attr_payload: dict) -> str:
+    """
+    모바일 텔레그램 /원인 명령어 포매터 (명세 §6)
+    """
+    period_key = "SUMMARY"
+    has_np = False
+    has_risk = False
+    for tok in tokens[1:]:
+        t = tok.strip().lower()
+        if t in _ATTR_PERIOD_ALIASES:
+            period_key = _ATTR_PERIOD_ALIASES[t]
+        elif t in ("연금제외", "연금빼고", "no_pension", "np"):
+            has_np = True
+        elif t in ("위험", "위험자산", "risk", "risk_only"):
+            has_risk = True
+
+    if has_np and has_risk:
+        scenario_key = "risk_no_pension"
+    elif has_np:
+        scenario_key = "no_pension"
+    elif has_risk:
+        scenario_key = "risk_only"
+    else:
+        scenario_key = "all"
+
+    scenarios = attr_payload.get("scenarios", {})
+    sc_obj = scenarios.get(scenario_key) or scenarios.get("all") or {}
+    if not sc_obj:
+        return f"{refresh_banner}⚠️ 기여도 분석 데이터를 생성하지 못했습니다."
+
+    as_of = attr_payload.get("as_of", "-")
+    sc_label = sc_obj.get("label", "연금포함 전체")
+    asset_count = sc_obj.get("asset_count", 0)
+    periods = sc_obj.get("periods", {})
+    daily_movers = sc_obj.get("daily_movers", {})
+
+    # (Mode A) 기본 3대 구간 종합 브리핑 (1D, 1W, peak_drawdown)
+    if period_key == "SUMMARY":
+        sc_suffix = f" <i>({html.escape(sc_label)})</i>" if scenario_key != "all" else ""
+        lines = [
+            refresh_banner.rstrip("\n"),
+            f"🔍 <b>[계좌 급등·급락 원인 종합 브리핑]</b> <i>{html.escape(as_of)}</i>{sc_suffix}",
+            "",
+        ]
+
+        # 1) 1D
+        p1d = periods.get("1D", {})
+        if p1d:
+            if p1d.get("is_market_closed_day"):
+                d_end = p1d.get("d_end", as_of)
+                try:
+                    is_wknd = datetime.strptime(d_end, "%Y-%m-%d").weekday() >= 5
+                except Exception:
+                    is_wknd = False
+                closed_tag = "주말 휴장" if is_wknd else "휴장/보합"
+                lines.append(f"📅 <b>1. 오늘 (1D)</b> : <b>₩0</b> (0.00%, {closed_tag})")
+                fb_date = p1d.get("fallback_trading_date")
+                fb = daily_movers.get(fb_date, {}) if fb_date else {}
+                if fb:
+                    lines.append(
+                        f"  • 직전 거래일({_fmt_mmdd(fb_date)}): "
+                        f"<b>{format_korean_money(fb.get('day_delta_krw', 0), signed=True)}</b> "
+                        f"({fb.get('day_return_pct', 0.0):+.2f}%)"
+                    )
+                    ld_s = " │ ".join(
+                        f"{html.escape(_short_attr_name(x['name']))} {format_korean_money(x['delta_krw'], signed=True)}({x['delta_pct']:+.1f}%)"
+                        for x in fb.get("top_leaders", [])[:2]
+                    )
+                    dr_s = " │ ".join(
+                        f"{html.escape(_short_attr_name(x['name']))} {format_korean_money(x['delta_krw'], signed=True)}({x['delta_pct']:+.1f}%)"
+                        for x in fb.get("top_draggers", [])[:2]
+                    )
+                    if ld_s:
+                        lines.append(f"  • ▲ {ld_s}")
+                    if dr_s:
+                        lines.append(f"  • ▼ {dr_s}")
+            else:
+                lines.append(
+                    f"📅 <b>1. 오늘 (1D, {_fmt_mmdd(p1d.get('d_end', as_of))})</b> : "
+                    f"<b>{format_korean_money(p1d.get('attr_delta_krw', 0), signed=True)}</b> "
+                    f"(<b>{p1d.get('attr_return_pct', 0.0):+.2f}%</b>)"
+                )
+                ld_s = " │ ".join(
+                    f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
+                    for x in p1d.get("top_leaders", [])[:2]
+                )
+                dr_s = " │ ".join(
+                    f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
+                    for x in p1d.get("top_draggers", [])[:2]
+                )
+                if ld_s:
+                    lines.append(f"  • ▲ {ld_s}")
+                if dr_s:
+                    lines.append(f"  • ▼ {dr_s}")
+            lines.append("")
+
+        # 2) 1W
+        p1w = periods.get("1W", {})
+        if p1w:
+            lines.append(
+                f"🗓️ <b>2. 최근 1주 (1W, {_fmt_mmdd(p1w.get('d_start'))}~{_fmt_mmdd(p1w.get('d_end'))})</b> : "
+                f"<b>{format_korean_money(p1w.get('attr_delta_krw', 0), signed=True)}</b> "
+                f"(<b>{p1w.get('attr_return_pct', 0.0):+.2f}%</b>)"
+            )
+            ld_s = " │ ".join(
+                f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
+                for x in p1w.get("top_leaders", [])[:2]
+            )
+            dr_s = " │ ".join(
+                f"{html.escape(_short_attr_name(x['name']))} <b>{format_korean_money(x['delta_krw'], signed=True)}</b>({x['delta_pct']:+.1f}%)"
+                for x in p1w.get("top_draggers", [])[:2]
+            )
+            if ld_s:
+                lines.append(f"  • 🚀 견인: {ld_s}")
+            if dr_s:
+                lines.append(f"  • 🔻 하락: {dr_s}")
+            lines.append("")
+
+        # 3) MDD
+        pmdd = periods.get("peak_drawdown", {})
+        if pmdd:
+            near_flat = bool(pmdd.get("is_near_flat_net"))
+            lines.append(
+                f"📉 <b>3. 고점대비 (MDD, {_fmt_mmdd(pmdd.get('d_start'))}~)</b> : "
+                f"NAV <b>{pmdd.get('period_return_pct', 0.0):+.2f}%</b> "
+                f"(시세 <b>{format_korean_money(pmdd.get('attr_delta_krw', 0), signed=True)}</b>, {pmdd.get('attr_return_pct', 0.0):+.2f}%)"
+            )
+            draggers = pmdd.get("top_draggers", [])[:3]
+            if draggers:
+                lines.append("  • 🔻 주범 Top 3:")
+                for idx, item in enumerate(draggers, 1):
+                    lines.append(
+                        f"    {idx}) {html.escape(item['name'])}: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> "
+                        f"({item['delta_pct']:+.1f}%, {_fmt_contrib(item, near_flat)})"
+                    )
+            lines.append("")
+
+        p1m = periods.get("1M", {})
+        notice = _build_rollover_notice(p1m.get("recent_trades") or (pmdd.get("recent_trades") if pmdd else []))
+        if notice:
+            lines.append(notice)
+        lines.append("💡 <i>상세: /원인 1D · /원인 1W · /원인 1M · /원인 YTD · /원인 고점</i>")
+        return "\n".join(lines)
+
+    # (Mode B) 특정 기간 상세 분석
+    p_obj = periods.get(period_key)
+    if not p_obj:
+        return f"{refresh_banner}⚠️ 요청한 기간({html.escape(period_key)}) 데이터를 찾지 못했습니다."
+
+    raw_label = p_obj.get("label", period_key)
+    disp_tag = "MDD" if period_key == "peak_drawdown" else ("반등" if period_key == "trough_gain" else period_key)
+    title_core = raw_label if f"({disp_tag})" in raw_label else f"{raw_label}({disp_tag})"
+    s_mmdd = _fmt_mmdd(p_obj.get("d_start"))
+    e_mmdd = _fmt_mmdd(p_obj.get("d_end"))
+    near_flat = bool(p_obj.get("is_near_flat_net"))
+    lines = [
+        refresh_banner.rstrip("\n"),
+        f"🔍 <b>[{html.escape(title_core)} 변동 원인 분석]</b> <i>{s_mmdd} ~ {e_mmdd}</i>",
+        "",
+        f"📌 <b>핵심 요약</b> ({html.escape(sc_label)} {asset_count}종)",
+    ]
+
+    if p_obj.get("is_market_closed_day"):
+        d_end = p_obj.get("d_end", as_of)
+        try:
+            is_wknd = datetime.strptime(d_end, "%Y-%m-%d").weekday() >= 5
+        except Exception:
+            is_wknd = False
+        closed_tag = "주말 휴장일" if is_wknd else "휴장일/보합"
+        lines.append(f"• 시세·환율 변동합: <b>₩0</b> (0.00%, {closed_tag})")
+        fb_date = p_obj.get("fallback_trading_date")
+        fb = daily_movers.get(fb_date, {}) if fb_date else {}
+        if fb:
+            lines.extend([
+                f"• 직전 거래일(<b>{html.escape(fb_date)}</b>) 마감 변동: "
+                f"<b>{format_korean_money(fb.get('day_delta_krw', 0), signed=True)}</b> ({fb.get('day_return_pct', 0.0):+.2f}%)",
+                "",
+            ])
+            fb_leaders = fb.get("top_leaders", [])[:3]
+            fb_draggers = fb.get("top_draggers", [])[:3]
+            if fb_leaders:
+                lines.append("🚀 <b>직전 거래일 상승 견인 Top 3</b>")
+                for idx, item in enumerate(fb_leaders, 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> ({item['delta_pct']:+.2f}%)"
+                    )
+                lines.append("")
+            if fb_draggers:
+                lines.append("🔻 <b>직전 거래일 하락 주범 Top 3</b>")
+                for idx, item in enumerate(fb_draggers, 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> ({item['delta_pct']:+.2f}%)"
+                    )
+                lines.append("")
+    else:
+        attr_delta = p_obj.get("attr_delta_krw", 0)
+        attr_ret = p_obj.get("attr_return_pct", 0.0)
+        nav_delta = p_obj.get("nav_delta_krw", 0)
+        nav_ret = p_obj.get("period_return_pct", 0.0)
+        residual = p_obj.get("residual_krw", 0)
+        lines.extend([
+            f"• 시세·환율 변동합: <b>{format_korean_money(attr_delta, signed=True)}</b> (<b>{attr_ret:+.2f}%</b>)",
+            f"• 시계열 NAV 변동: {format_korean_money(nav_delta, signed=True)} "
+            f"(<b>{nav_ret:+.2f}%</b>, 매매·스냅샷 차 {format_korean_money(residual, signed=True)})",
+            "",
+        ])
+
+        leaders = p_obj.get("top_leaders", [])
+        draggers = p_obj.get("top_draggers", [])
+        if attr_delta < 0:
+            if draggers:
+                lines.append("🔻 <b>주요 하락 주범 Top 5</b>")
+                for idx, item in enumerate(draggers[:5], 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> "
+                        f"({item['delta_pct']:+.2f}%, {_fmt_contrib(item, near_flat)})"
+                    )
+                lines.append("")
+            if leaders:
+                lines.append("🚀 <b>주요 상승 견인 Top 3</b>")
+                for idx, item in enumerate(leaders[:3], 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> "
+                        f"({item['delta_pct']:+.2f}%, {_fmt_contrib(item, near_flat)})"
+                    )
+                lines.append("")
+        else:
+            if leaders:
+                lines.append("🚀 <b>주요 상승 견인 Top 5</b>")
+                for idx, item in enumerate(leaders[:5], 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> "
+                        f"({item['delta_pct']:+.2f}%, {_fmt_contrib(item, near_flat)})"
+                    )
+                lines.append("")
+            if draggers:
+                lines.append("🔻 <b>주요 하락 주범 Top 3</b>")
+                for idx, item in enumerate(draggers[:3], 1):
+                    lines.append(
+                        f"{idx}. <b>{html.escape(item['name'])}</b>: "
+                        f"<b>{format_korean_money(item['delta_krw'], signed=True)}</b> "
+                        f"({item['delta_pct']:+.2f}%, {_fmt_contrib(item, near_flat)})"
+                    )
+                lines.append("")
+
+        nz_factors = [f for f in p_obj.get("factors", []) if abs(f.get("delta_krw", 0)) > 0]
+        if nz_factors:
+            lines.append("🧩 <b>6대 테마 팩터 기여</b>")
+            for fobj in nz_factors:
+                c_str = f"{fobj.get('contrib_pp', 0.0):+.2f}%p" if near_flat else f"{fobj.get('contrib_pct', 0.0):+.1f}%"
+                lines.append(
+                    f"• {fobj.get('icon', '')} {html.escape(fobj.get('label', ''))}: "
+                    f"<b>{format_korean_money(fobj.get('delta_krw', 0), signed=True)}</b> ({c_str})"
+                )
+            lines.append("")
+
+    notice = _build_rollover_notice(p_obj.get("recent_trades", []))
+    if notice:
+        lines.append(notice)
+    lines.append("💡 <i>다른 기간: /원인 1D · /원인 1W · /원인 1M · /원인 YTD · /원인 고점</i>")
+    return "\n".join(lines)
+
+
 def generate_telegram_summary(query_text="all", force_refresh=True):
     """
     텔레그램 봇 모바일 가독성 혁신 및 명령어 고도화 브리핑 엔진 (Phase 21 SSoT)
@@ -1177,6 +1595,7 @@ def generate_telegram_summary(query_text="all", force_refresh=True):
 📊 <b>종합 브리핑</b>
 • <code>/자산</code> 또는 <code>/요약</code> : 전체 순자산 & 7일 추세
 • <code>/수익률</code> : 7대 기간별 수익률 & 상하위 종목
+• <code>/원인</code> : 급등·급락 원인 종목 & 6대 팩터 분석 (<code>/원인 1M</code>, <code>/원인 고점</code>)
 • <code>/비중</code> : 대분류·위험도·테마별 비중 분석
 
 🏛️ <b>자본금 & 결산 (Phase 20)</b>
@@ -1206,6 +1625,17 @@ def generate_telegram_summary(query_text="all", force_refresh=True):
 
     # 모바일 최적화 한 줄 슬림 배너
     refresh_banner = f"⚡ {now_hm} 시세 반영 (성공 {crawled_count}건)\n"
+
+    # (0-b) /원인 · /변동 · /급등락 · /주범 명령어 (Phase 28 SSoT)
+    q_tokens = [tok.strip() for tok in q.split() if tok.strip()]
+    if q_tokens and q_tokens[0] in ["원인", "변동", "급등락", "주범", "attribution", "movers"]:
+        attr_payload = get_attribution_data(
+            force_refresh=force_refresh,
+            refresh_tickers=False,
+            live_assets=assets,
+            live_market_data=_cache.get("data"),
+        )
+        return format_attribution_telegram(q_tokens, refresh_banner, attr_payload)
 
     pnl_total = nav_total - buy_total
     ret_total = (pnl_total / (buy_total or 1) * 100) if buy_total > 0 else 0.0
@@ -1756,6 +2186,16 @@ def handle_telegram_trade_message(text: str, chat_id=None) -> str:
 
         # Fetch fresh live assets and fresh NAV
         assets_fresh, nav_fresh, _, _, _, _, _, _, _, _ = get_live_assets(force_refresh=True)
+        _invalidate_attribution_cache()
+        try:
+            get_attribution_data(
+                force_refresh=True,
+                refresh_tickers=False,
+                live_assets=assets_fresh,
+                live_market_data=_cache.get("data"),
+            )
+        except Exception:
+            pass
         result["total_nav"] = nav_fresh
         # Update asset valuation with latest market price
         matched_id = trade_info["asset"]["id"]
@@ -1855,6 +2295,8 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
 
         if parsed_path.startswith("/api/prices"):
             self.handle_api_prices()
+        elif parsed_path.startswith("/api/attribution"):
+            self.handle_api_attribution()
         elif parsed_path.startswith("/api/history"):
             self.handle_api_history()
         elif parsed_path.startswith("/api/backfill/status"):
@@ -1972,6 +2414,101 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_error_json(str(e))
 
+    def handle_api_attribution(self):
+        try:
+            from urllib.parse import parse_qs
+            query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+            refresh_flag = query.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            include_daily = query.get("include_daily", ["1"])[0].strip().lower() not in ("0", "false", "no")
+            raw_scenario = query.get("scenario", ["full"])[0].strip()
+            raw_period = query.get("period", [""])[0].strip()
+
+            if raw_scenario in ("", "full", "all_scenarios"):
+                scenario_req = "full"
+            else:
+                scenario_req = normalize_scenario(raw_scenario)
+                if scenario_req not in ATTR_SCENARIO_DEFS:
+                    err_body = json.dumps(
+                        {"status": "error", "message": f"Unsupported scenario: {raw_scenario}"},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+
+            period_req = ""
+            if raw_period:
+                period_alias = {
+                    "1d": "1D", "1w": "1W", "1m": "1M", "3m": "3M",
+                    "6m": "6M", "ytd": "YTD", "1y": "1Y",
+                    "mdd": "peak_drawdown", "peak": "peak_drawdown",
+                    "trough": "trough_gain",
+                }
+                period_req = period_alias.get(raw_period.lower(), raw_period)
+                if period_req not in ATTR_PERIOD_ORDER:
+                    err_body = json.dumps(
+                        {"status": "error", "message": f"Unsupported period: {raw_period}"},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+
+            payload = get_attribution_data(
+                force_refresh=refresh_flag,
+                refresh_tickers=refresh_flag,
+            )
+
+            if period_req:
+                sc = "all" if scenario_req == "full" else scenario_req
+                period_data = payload.get("scenarios", {}).get(sc, {}).get("periods", {}).get(period_req)
+                resp = {
+                    "status": payload.get("status", "success"),
+                    "as_of": payload.get("as_of"),
+                    "updated_at": payload.get("updated_at"),
+                    "coverage": payload.get("coverage"),
+                    "scenario": sc,
+                    "period": period_req,
+                    "data": period_data,
+                }
+            elif scenario_req != "full":
+                sc_data = dict(payload.get("scenarios", {}).get(scenario_req, {}))
+                if not include_daily:
+                    sc_data.pop("daily_movers", None)
+                resp = {
+                    "status": payload.get("status", "success"),
+                    "as_of": payload.get("as_of"),
+                    "updated_at": payload.get("updated_at"),
+                    "coverage": payload.get("coverage"),
+                    "scenario": scenario_req,
+                    "data": sc_data,
+                }
+            elif include_daily:
+                resp = payload
+            else:
+                resp = {
+                    k: v for k, v in payload.items() if k != "scenarios"
+                }
+                resp["scenarios"] = {
+                    sc_k: {sk: sv for sk, sv in sc_v.items() if sk != "daily_movers"}
+                    for sc_k, sc_v in payload.get("scenarios", {}).items()
+                }
+
+            body = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_error_json(str(e))
+
     def handle_api_telegram_status(self):
         try:
             body = json.dumps(_telegram_status, ensure_ascii=False).encode("utf-8")
@@ -2059,7 +2596,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
             "ips": get_server_ips(),
             "backfill_status": _backfill_status,
             "endpoints": [
-                "/", "/api/prices", "/api/history", "/api/snapshot",
+                "/", "/api/prices", "/api/history", "/api/attribution", "/api/snapshot",
                 "/api/backfill/status", "/api/reports/monthly", "/api/telegram/status",
                 "/api/telegram/send-summary", "/api/health"
             ]
@@ -2144,39 +2681,53 @@ def run_server():
             "completed_at": datetime.now(KST).isoformat()
         }
 
+    # [1-b/3] 기여도 분석 캐시 초기화 / 백필 연계 갱신
+    try:
+        need_attr_refresh = bool(_backfill_status.get("backfill_executed")) or (not os.path.exists(ATTRIBUTION_CACHE_FILE))
+        get_attribution_data(force_refresh=need_attr_refresh, refresh_tickers=False)
+    except Exception as e:
+        print(f"   [AttributionEngine 경고] 기여도 캐시 초기화 오류: {e}")
+
     server_address = (HOST, PORT)
     try:
         httpd = http.server.ThreadingHTTPServer(server_address, UnifiedServerHandler)
     except OSError as e:
         if "address already in use" in str(e).lower() or getattr(e, 'winerror', None) == 10048 or getattr(e, 'errno', None) == 10048:
             print(f"\n[경고] 포트 {PORT}가 이미 점유되어 있습니다.")
-            print("자산 관제탑 서버가 이미 실행 중일 수 있습니다. 브라우저에서 http://127.0.0.1:8765/ 를 확인하세요.")
+            print(f"자산 관제탑 서버가 이미 실행 중일 수 있습니다. 브라우저에서 http://127.0.0.1:{PORT}/ 를 확인하세요.")
             return
         raise
 
     ips = get_server_ips()
-    print("   [2/3] 포트 바인딩 완료 (0.0.0.0:8765)")
+    print(f"   [2/3] 포트 바인딩 완료 ({HOST}:{PORT})")
     print(f"   Local URL     : http://127.0.0.1:{PORT}/")
     for lip in ips.get("local", []):
         print(f"   LAN URL       : http://{lip}:{PORT}/")
     for tip in ips.get("tailscale", []):
         print(f"   Tailscale URL : http://{tip}:{PORT}/")
-    print(f"   APIs          : /api/prices, /api/history, /api/snapshot, /api/backfill/status")
+    print(f"   APIs          : /api/prices, /api/history, /api/attribution, /api/snapshot, /api/backfill/status")
 
-    # Start background Telegram bot polling worker
-    t_tg = threading.Thread(target=telegram_polling_worker, daemon=True, name="TelegramPollingWorker")
-    t_tg.start()
-    print("   [3/3] Telegram Bot: @sjstck_bot polling active")
+    # Start background Telegram bot polling worker unless disabled
+    if DISABLE_TG_POLL:
+        _telegram_status["status"] = "polling_disabled"
+        print("   [3/3] Telegram Bot polling disabled (DISABLE_TG_POLL=1)")
+    else:
+        t_tg = threading.Thread(target=telegram_polling_worker, daemon=True, name="TelegramPollingWorker")
+        t_tg.start()
+        print("   [3/3] Telegram Bot: @sjstck_bot polling active")
 
-    # Auto-open browser in background thread
-    def _open_browser():
-        time.sleep(1.0)
-        try:
-            import webbrowser
-            webbrowser.open(f"http://127.0.0.1:{PORT}/")
-        except Exception:
-            pass
-    threading.Thread(target=_open_browser, daemon=True, name="BrowserAutoOpen").start()
+    # Auto-open browser in background thread unless disabled
+    if NO_BROWSER:
+        print("   [Browser] Auto-open disabled (NO_BROWSER=1)")
+    else:
+        def _open_browser():
+            time.sleep(1.0)
+            try:
+                import webbrowser
+                webbrowser.open(f"http://127.0.0.1:{PORT}/")
+            except Exception:
+                pass
+        threading.Thread(target=_open_browser, daemon=True, name="BrowserAutoOpen").start()
 
     print("=" * 60)
     print("🏛️ 자산 관제탑 서버 정상 가동 중 (창을 닫으면 서버가 종료됩니다)")

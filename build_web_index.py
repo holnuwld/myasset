@@ -14,34 +14,134 @@ Full Implementation of:
 
 import json
 import os
+import sys
 from datetime import datetime, date, timedelta
+
+# Ensure all file I/O strictly stays inside this script's repository directory
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+WEB_DIR = os.path.join(BASE_DIR, "web")
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
 
 # Import common metrics module
 try:
-    from history_metrics import (
-        is_risk_asset, ledger_buy_totals,
-        build_period_returns, build_buy_series
-    )
-except ImportError:
     from src.history_metrics import (
         is_risk_asset, ledger_buy_totals,
         build_period_returns, build_buy_series
     )
+except ImportError:
+    from history_metrics import (
+        is_risk_asset, ledger_buy_totals,
+        build_period_returns, build_buy_series
+    )
 
-with open("data/assets_v3.json", "r", encoding="utf-8") as f:
+with open(os.path.join(DATA_DIR, "assets_v3.json"), "r", encoding="utf-8") as f:
     assets_raw = f.read()
 assets_list = json.loads(assets_raw)
 
 transactions_raw = "[]"
-if os.path.exists("data/transactions.json"):
+tx_file_path = os.path.join(DATA_DIR, "transactions.json")
+if os.path.exists(tx_file_path):
     try:
-        with open("data/transactions.json", "r", encoding="utf-8") as f:
+        with open(tx_file_path, "r", encoding="utf-8") as f:
             transactions_raw = f.read().strip() or "[]"
     except Exception:
         transactions_raw = "[]"
 
-with open("data/calculated_history_cache.json", "r", encoding="utf-8") as f:
+with open(os.path.join(DATA_DIR, "calculated_history_cache.json"), "r", encoding="utf-8") as f:
     history_cache = json.load(f)
+
+def load_compact_attribution_raw(attr_path):
+    """Load data/attribution_cache.json and compact it for offline HTML embedding."""
+    if not os.path.exists(attr_path):
+        return json.dumps({"schema_version": "1.0", "status": "empty", "scenarios": {}}, ensure_ascii=False)
+    try:
+        with open(attr_path, "r", encoding="utf-8") as f:
+            raw_data = json.load(f)
+    except Exception:
+        return json.dumps({"schema_version": "1.0", "status": "error", "scenarios": {}}, ensure_ascii=False)
+
+    compact = {
+        "schema_version": raw_data.get("schema_version", "1.0"),
+        "status": raw_data.get("status", "success"),
+        "as_of": raw_data.get("as_of", ""),
+        "updated_at": raw_data.get("updated_at", ""),
+        "coverage": raw_data.get("coverage", {}),
+        "scenarios": {},
+    }
+    for sc_key, sc_val in raw_data.get("scenarios", {}).items():
+        c_periods = {}
+        for p_key, p_val in sc_val.get("periods", {}).items():
+            p_obj = {k: v for k, v in p_val.items() if k != "by_asset"}
+            if sc_key == "all":
+                p_obj["by_asset"] = {
+                    aid: {
+                        "asset_id": ar.get("asset_id"),
+                        "delta_krw": ar.get("delta_krw"),
+                        "delta_pct": ar.get("delta_pct"),
+                        "local_return_pct": ar.get("local_return_pct"),
+                        "price_delta_krw": ar.get("price_delta_krw"),
+                        "fx_delta_krw": ar.get("fx_delta_krw"),
+                        "contrib_pct": ar.get("contrib_pct"),
+                        "contrib_pp": ar.get("contrib_pp"),
+                        "valuation_start_krw": ar.get("valuation_start_krw"),
+                        "valuation_end_krw": ar.get("valuation_end_krw"),
+                        "is_bfill_estimated": bool(ar.get("is_bfill_estimated", False)),
+                    }
+                    for aid, ar in p_val.get("by_asset", {}).items()
+                }
+            c_periods[p_key] = p_obj
+
+        c_dm = {}
+        for dt, dmv in sc_val.get("daily_movers", {}).items():
+            if dmv.get("is_flat_day"):
+                c_dm[dt] = {
+                    "date": dt,
+                    "is_flat_day": True,
+                    "day_delta_krw": 0,
+                    "day_return_pct": 0.0,
+                    "top_leaders": [],
+                    "top_draggers": [],
+                    "note": dmv.get("note", "휴장일 (시세 변동 없음)"),
+                }
+            else:
+                c_dm[dt] = {
+                    "date": dt,
+                    "is_flat_day": False,
+                    "day_delta_krw": dmv.get("day_delta_krw", 0),
+                    "day_return_pct": dmv.get("day_return_pct", 0.0),
+                    "top_leaders": [
+                        {
+                            "asset_id": x.get("asset_id"),
+                            "name": x.get("name"),
+                            "ticker": x.get("ticker"),
+                            "delta_krw": x.get("delta_krw"),
+                            "delta_pct": x.get("delta_pct"),
+                        }
+                        for x in dmv.get("top_leaders", [])[:2]
+                    ],
+                    "top_draggers": [
+                        {
+                            "asset_id": x.get("asset_id"),
+                            "name": x.get("name"),
+                            "ticker": x.get("ticker"),
+                            "delta_krw": x.get("delta_krw"),
+                            "delta_pct": x.get("delta_pct"),
+                        }
+                        for x in dmv.get("top_draggers", [])[:2]
+                    ],
+                }
+        compact["scenarios"][sc_key] = {
+            "scenario": sc_val.get("scenario", sc_key),
+            "label": sc_val.get("label", sc_key),
+            "asset_count": sc_val.get("asset_count", 0),
+            "periods": c_periods,
+            "daily_movers": c_dm,
+        }
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+attribution_raw = load_compact_attribution_raw(os.path.join(DATA_DIR, "attribution_cache.json"))
 
 # 원장 기준 총 매수원금 (동적 계산)
 total_buy, total_buy_np, total_buy_risk, total_buy_np_risk = ledger_buy_totals(assets_list)
@@ -55,9 +155,10 @@ daily_nav_np_risk = history_cache.get("daily_nav_no_pension_risk", {})
 
 # data/asset_history.json 에서 실자산 스냅샷 로드 및 덮어쓰기
 real_history = []
-if os.path.exists("data/asset_history.json"):
+asset_history_path = os.path.join(DATA_DIR, "asset_history.json")
+if os.path.exists(asset_history_path):
     try:
-        with open("data/asset_history.json", "r", encoding="utf-8") as f:
+        with open(asset_history_path, "r", encoding="utf-8") as f:
             real_history = json.load(f)
             for item in real_history:
                 d = item.get("date")
@@ -633,6 +734,26 @@ html_content = r'''<!DOCTYPE html>
       border-radius: 6px;
       padding: 4px 2px;
       text-align: center;
+      cursor: pointer;
+      transition: transform 0.14s ease, border-color 0.16s ease, box-shadow 0.16s ease, background-color 0.16s ease;
+      user-select: none;
+    }
+    .period-chip:hover {
+      border-color: var(--accent-sky);
+      transform: translateY(-1px);
+      background: var(--bg-card-hover);
+    }
+    .period-chip:focus-visible {
+      outline: 2px solid var(--accent-sky);
+      outline-offset: 1px;
+    }
+    .period-chip.attr-active {
+      border-color: var(--accent-sky) !important;
+      background: rgba(14, 165, 233, 0.15) !important;
+      box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.38), 0 0 12px rgba(99, 102, 241, 0.25);
+    }
+    html.light .period-chip.attr-active {
+      background: rgba(14, 165, 233, 0.10) !important;
     }
     .chip-term {
       font-size: 0.68rem;
@@ -953,6 +1074,496 @@ html_content = r'''<!DOCTYPE html>
       overflow: hidden;
       text-overflow: ellipsis;
       min-width: 0;
+    }
+    .hover-movers-row {
+      grid-column: 1 / -1;
+      min-height: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 10px;
+      border-top: 1px dashed var(--border-subtle);
+      padding-top: 6px;
+      margin-top: 2px;
+      font-size: 0.76rem;
+      color: var(--text-secondary);
+      min-width: 0;
+      width: 100%;
+    }
+    .hover-day-delta {
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: rgba(148, 163, 184, 0.12);
+    }
+    .hover-day-delta.pos { color: var(--profit-positive); background: rgba(16, 185, 129, 0.12); }
+    .hover-day-delta.neg { color: var(--profit-negative); background: rgba(244, 63, 94, 0.12); }
+    .hover-mover-group {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 4px;
+      min-width: 0;
+    }
+    .hover-mover-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      padding: 1px 6px;
+      border-radius: 5px;
+      font-size: 0.73rem;
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      max-width: 100%;
+    }
+    .hover-mover-chip.up {
+      background: rgba(16, 185, 129, 0.13);
+      color: var(--profit-positive);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+    }
+    .hover-mover-chip.down {
+      background: rgba(244, 63, 94, 0.13);
+      color: var(--profit-negative);
+      border: 1px solid rgba(244, 63, 94, 0.25);
+    }
+    .hover-mover-flat {
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+    .hover-mover-empty {
+      color: var(--text-muted);
+    }
+
+    /* 🔍 기간별 급등·급락 원인 분석 패널 (#attributionPanel) */
+    .attribution-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 18px;
+      padding: 20px 22px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-sm);
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .attr-panel-header {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .attr-title-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .attr-title-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+    .attr-title-text {
+      font-size: 1.04rem;
+      font-weight: 800;
+      color: var(--text-primary);
+    }
+    .attr-header-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      font-size: 0.75rem;
+    }
+    .attr-meta-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.73rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      font-variant-numeric: tabular-nums;
+    }
+    .attr-meta-badge.scenario {
+      background: rgba(99, 102, 241, 0.14);
+      border-color: rgba(99, 102, 241, 0.35);
+      color: var(--accent-indigo);
+    }
+    .attr-meta-badge.pos {
+      background: rgba(16, 185, 129, 0.13);
+      border-color: rgba(16, 185, 129, 0.35);
+      color: var(--profit-positive);
+    }
+    .attr-meta-badge.neg {
+      background: rgba(244, 63, 94, 0.13);
+      border-color: rgba(244, 63, 94, 0.35);
+      color: var(--profit-negative);
+    }
+    .attr-collapse-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s;
+    }
+    .attr-collapse-btn:hover {
+      border-color: var(--border-hover);
+      color: var(--text-primary);
+      background: var(--bg-card-hover);
+    }
+    .attr-period-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      align-items: center;
+    }
+    .attr-period-pill {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      border-radius: 8px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .attr-period-pill:hover {
+      border-color: var(--accent-sky);
+      color: var(--text-primary);
+    }
+    .attr-period-pill.attr-active,
+    .attr-period-pill.active {
+      background: var(--accent-indigo);
+      border-color: var(--accent-indigo);
+      color: #ffffff;
+      box-shadow: 0 0 10px rgba(99, 102, 241, 0.3);
+    }
+    .attr-auto-summary {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-left: 3px solid var(--accent-indigo);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+      font-size: 0.85rem;
+      color: var(--text-primary);
+      line-height: 1.55;
+    }
+    .attr-summary-badges {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      font-size: 0.74rem;
+    }
+    .attr-quick-btn {
+      background: rgba(14, 165, 233, 0.15);
+      border: 1px solid rgba(14, 165, 233, 0.4);
+      color: var(--accent-sky);
+      border-radius: 6px;
+      padding: 2px 8px;
+      font-size: 0.73rem;
+      font-weight: 700;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .attr-quick-btn:hover {
+      background: var(--accent-sky);
+      color: #ffffff;
+    }
+    .attr-trade-notice {
+      background: rgba(245, 158, 11, 0.08);
+      border: 1px solid rgba(245, 158, 11, 0.32);
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-bottom: 14px;
+      font-size: 0.77rem;
+      color: var(--text-secondary);
+    }
+    .attr-trade-notice-title {
+      font-weight: 700;
+      color: var(--accent-amber);
+      margin-bottom: 4px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .attr-trade-notice-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .attr-trade-notice-item {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      line-height: 1.4;
+    }
+    .attr-movers-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+    .attr-movers-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 14px;
+      min-width: 0;
+    }
+    .attr-movers-card-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.86rem;
+      font-weight: 700;
+      margin-bottom: 10px;
+      padding-bottom: 7px;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .attr-movers-list {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+      min-width: 0;
+    }
+    .attr-mover-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: var(--bg-surface);
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      min-width: 0;
+    }
+    .attr-mover-row.ref-fallback {
+      opacity: 0.84;
+      border-style: dashed;
+    }
+    .attr-mover-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 8px;
+      min-width: 0;
+    }
+    .attr-mover-left {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+      flex-wrap: wrap;
+    }
+    .attr-mover-rank {
+      width: 18px;
+      height: 18px;
+      border-radius: 5px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.68rem;
+      font-weight: 700;
+      background: var(--bg-card);
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .attr-mover-name {
+      font-size: 0.80rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 190px;
+    }
+    .attr-acct-badge {
+      font-size: 0.66rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+      background: rgba(148, 163, 184, 0.12);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      padding: 1px 5px;
+      border-radius: 4px;
+      white-space: nowrap;
+      max-width: 140px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .attr-mover-right {
+      text-align: right;
+      flex-shrink: 0;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .attr-mover-delta {
+      font-size: 0.82rem;
+      font-weight: 700;
+    }
+    .attr-mover-meta {
+      font-size: 0.69rem;
+      color: var(--text-muted);
+    }
+    .attr-bar-track {
+      width: 100%;
+      height: 6px;
+      background: rgba(148, 163, 184, 0.14);
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .attr-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.25s ease;
+    }
+    .attr-bar-fill.neg { background: linear-gradient(90deg, #e11d48, #fb7185); }
+    .attr-bar-fill.pos { background: linear-gradient(90deg, #059669, #34d399); }
+    .attr-mover-sub {
+      font-size: 0.69rem;
+      color: var(--text-muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }
+    .attr-factors-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .attr-factors-title {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--text-primary);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .attr-factors-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .attr-factor-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      min-width: 0;
+    }
+    .attr-factor-card.fx-overlay {
+      border-color: rgba(14, 165, 233, 0.35);
+      background: rgba(14, 165, 233, 0.04);
+    }
+    .attr-factor-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.77rem;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .attr-factor-label {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .attr-factor-val-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 6px;
+      font-variant-numeric: tabular-nums;
+    }
+    .attr-factor-sub {
+      font-size: 0.69rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+    .attr-empty-state {
+      padding: 14px 10px;
+      text-align: center;
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      background: var(--bg-surface);
+      border-radius: 8px;
+      border: 1px dashed var(--border-subtle);
+    }
+
+    /* 원장 테이블 상단 기간 전환 탭 */
+    .assets-table-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      justify-content: flex-end;
+    }
+    .assets-table-period-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      align-items: center;
+    }
+    .table-period-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-secondary);
+      border-radius: 7px;
+      padding: 5px 10px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .table-period-btn:hover {
+      border-color: var(--accent-sky);
+      color: var(--text-primary);
+    }
+    .table-period-btn.active {
+      background: var(--accent-indigo);
+      border-color: var(--accent-indigo);
+      color: #ffffff;
+    }
+    .table-sub-meta {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      line-height: 1.2;
+      margin-top: 2px;
+    }
+    @media (max-width: 960px) {
+      .attr-factors-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
 
     .svg-chart-container {
@@ -1462,6 +2073,21 @@ html_content = r'''<!DOCTYPE html>
       .hover-item-return { grid-column: 2 / 3 !important; text-align: right !important; }
       .hover-item-nav { grid-column: 1 / -1 !important; min-width: 0 !important; max-width: none !important; }
       .hover-banner-badge { display: none !important; }
+      .hover-movers-row { font-size: 0.68rem !important; gap: 4px 6px !important; min-height: 24px !important; padding-top: 5px !important; }
+      .hover-mover-chip { font-size: 0.65rem !important; padding: 1px 5px !important; }
+      .attribution-panel { padding: 12px 10px !important; border-radius: 14px !important; }
+      .attr-title-text { font-size: 0.92rem !important; }
+      .attr-period-pills { display: grid !important; grid-template-columns: repeat(3, minmax(0, 1fr)) !important; gap: 4px !important; width: 100%; }
+      .attr-period-pill { padding: 5px 4px !important; font-size: 0.68rem !important; text-align: center; }
+      .attr-auto-summary { padding: 10px 10px !important; font-size: 0.77rem !important; }
+      .attr-movers-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
+      .attr-movers-card { padding: 10px 8px !important; }
+      .attr-mover-name { max-width: 140px !important; font-size: 0.74rem !important; }
+      .attr-mover-delta { font-size: 0.75rem !important; }
+      .attr-factors-grid { grid-template-columns: 1fr !important; gap: 8px !important; }
+      .assets-table-controls { width: 100%; justify-content: flex-start; }
+      .assets-table-period-tabs { width: 100%; gap: 4px; }
+      .table-period-btn { font-size: 0.68rem !important; padding: 4px 7px !important; }
       .svg-chart-container { height: 220px; width: 100%; }
       .chart-card { padding: 12px 10px; width: 100%; box-sizing: border-box; }
       .breakdown-row { padding: 4px 3px; font-size: 0.74rem; gap: 5px; }
@@ -1625,46 +2251,46 @@ html_content = r'''<!DOCTYPE html>
         </div>
 
         <!-- 1D / 1W / 1M / 3M / 6M / YTD / 1Y 이전 대비 수익률 칩 박스 (메인 9개 + 위험자산 9개) -->
-        <div class="period-returns-container">
+        <div class="period-returns-container" id="periodReturnsStrip">
           <div class="period-returns-box">
             <div class="period-returns-title">
               <span>📈 전체 자산 기간별 수익률</span>
-              <span style="color:var(--accent-sky); font-size:0.75rem;">9개 구간</span>
+              <span style="color:var(--accent-sky); font-size:0.75rem;">클릭 시 원인 분석 ▾</span>
             </div>
             <div class="period-chips-row">
-              <div class="period-chip">
+              <div class="period-chip" data-period="1Y" data-period-key="1Y" role="button" tabindex="0" onclick="selectAttributionPeriod('1Y')" onkeydown="handlePeriodChipKey(event, '1Y')">
                 <span class="chip-term">1Y</span>
                 <span class="chip-rate num" id="ret_1Y">+19.64%</span>
               </div>
-              <div class="period-chip" style="border-color:var(--accent-indigo);">
+              <div class="period-chip" data-period="YTD" data-period-key="YTD" role="button" tabindex="0" onclick="selectAttributionPeriod('YTD')" onkeydown="handlePeriodChipKey(event, 'YTD')" style="border-color:var(--accent-indigo);">
                 <span class="chip-term" style="color:var(--accent-indigo); font-weight:700;">YTD</span>
                 <span class="chip-rate num" id="ret_YTD" style="color:var(--accent-indigo);">+15.97%</span>
               </div>
-              <div class="period-chip">
+              <div class="period-chip" data-period="6M" data-period-key="6M" role="button" tabindex="0" onclick="selectAttributionPeriod('6M')" onkeydown="handlePeriodChipKey(event, '6M')">
                 <span class="chip-term">6M</span>
                 <span class="chip-rate num" id="ret_6M">-17.61%</span>
               </div>
-              <div class="period-chip">
+              <div class="period-chip" data-period="3M" data-period-key="3M" role="button" tabindex="0" onclick="selectAttributionPeriod('3M')" onkeydown="handlePeriodChipKey(event, '3M')">
                 <span class="chip-term">3M</span>
                 <span class="chip-rate num" id="ret_3M">-4.10%</span>
               </div>
-              <div class="period-chip">
+              <div class="period-chip" data-period="1M" data-period-key="1M" role="button" tabindex="0" onclick="selectAttributionPeriod('1M')" onkeydown="handlePeriodChipKey(event, '1M')">
                 <span class="chip-term">1M</span>
                 <span class="chip-rate num" id="ret_1M">-11.47%</span>
               </div>
-              <div class="period-chip">
+              <div class="period-chip" data-period="1W" data-period-key="1W" role="button" tabindex="0" onclick="selectAttributionPeriod('1W')" onkeydown="handlePeriodChipKey(event, '1W')">
                 <span class="chip-term">1W</span>
                 <span class="chip-rate num" id="ret_1W">-4.30%</span>
               </div>
-              <div class="period-chip">
+              <div class="period-chip attr-active" data-period="1D" data-period-key="1D" role="button" tabindex="0" onclick="selectAttributionPeriod('1D')" onkeydown="handlePeriodChipKey(event, '1D')">
                 <span class="chip-term">1D</span>
                 <span class="chip-rate num" id="ret_1D">+0.58%</span>
               </div>
-              <div class="period-chip" title="기간 최고점 대비 하락률 (Drawdown from Peak)">
+              <div class="period-chip" data-period="peak_drawdown" data-period-key="peak_drawdown" role="button" tabindex="0" onclick="selectAttributionPeriod('peak_drawdown')" onkeydown="handlePeriodChipKey(event, 'peak_drawdown')" title="기간 최고점 대비 하락률 (Drawdown from Peak)">
                 <span class="chip-term" style="color:var(--profit-negative);">고점대비</span>
                 <span class="chip-rate num" id="ret_peak_drawdown" style="color:var(--profit-negative);">-0.00%</span>
               </div>
-              <div class="period-chip" title="기간 최저점 대비 반등률 (Gain from Trough)">
+              <div class="period-chip" data-period="trough_gain" data-period-key="trough_gain" role="button" tabindex="0" onclick="selectAttributionPeriod('trough_gain')" onkeydown="handlePeriodChipKey(event, 'trough_gain')" title="기간 최저점 대비 반등률 (Gain from Trough)">
                 <span class="chip-term" style="color:var(--profit-positive);">저점대비</span>
                 <span class="chip-rate num" id="ret_trough_gain" style="color:var(--profit-positive);">+0.00%</span>
               </div>
@@ -1678,39 +2304,39 @@ html_content = r'''<!DOCTYPE html>
               <span id="riskSubBadge" style="color:var(--accent-amber); font-size:0.7rem; font-weight:600;">(투자자산 기준)</span>
             </div>
             <div class="period-chips-row period-chips-risk-row">
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm" data-period="1Y" data-period-key="1Y" role="button" tabindex="0" onclick="selectAttributionPeriod('1Y')" onkeydown="handlePeriodChipKey(event, '1Y')">
                 <span class="chip-term">1Y</span>
                 <span class="chip-rate num" id="ret_risk_1Y">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm" style="border-color:var(--accent-amber);">
+              <div class="period-chip chip-sm" data-period="YTD" data-period-key="YTD" role="button" tabindex="0" onclick="selectAttributionPeriod('YTD')" onkeydown="handlePeriodChipKey(event, 'YTD')" style="border-color:var(--accent-amber);">
                 <span class="chip-term" style="color:var(--accent-amber); font-weight:700;">YTD</span>
                 <span class="chip-rate num" id="ret_risk_YTD" style="color:var(--accent-amber);">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm" data-period="6M" data-period-key="6M" role="button" tabindex="0" onclick="selectAttributionPeriod('6M')" onkeydown="handlePeriodChipKey(event, '6M')">
                 <span class="chip-term">6M</span>
                 <span class="chip-rate num" id="ret_risk_6M">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm" data-period="3M" data-period-key="3M" role="button" tabindex="0" onclick="selectAttributionPeriod('3M')" onkeydown="handlePeriodChipKey(event, '3M')">
                 <span class="chip-term">3M</span>
                 <span class="chip-rate num" id="ret_risk_3M">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm" data-period="1M" data-period-key="1M" role="button" tabindex="0" onclick="selectAttributionPeriod('1M')" onkeydown="handlePeriodChipKey(event, '1M')">
                 <span class="chip-term">1M</span>
                 <span class="chip-rate num" id="ret_risk_1M">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm" data-period="1W" data-period-key="1W" role="button" tabindex="0" onclick="selectAttributionPeriod('1W')" onkeydown="handlePeriodChipKey(event, '1W')">
                 <span class="chip-term">1W</span>
                 <span class="chip-rate num" id="ret_risk_1W">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm">
+              <div class="period-chip chip-sm attr-active" data-period="1D" data-period-key="1D" role="button" tabindex="0" onclick="selectAttributionPeriod('1D')" onkeydown="handlePeriodChipKey(event, '1D')">
                 <span class="chip-term">1D</span>
                 <span class="chip-rate num" id="ret_risk_1D">+0.00%</span>
               </div>
-              <div class="period-chip chip-sm" title="위험자산 최고점 대비 하락률">
+              <div class="period-chip chip-sm" data-period="peak_drawdown" data-period-key="peak_drawdown" role="button" tabindex="0" onclick="selectAttributionPeriod('peak_drawdown')" onkeydown="handlePeriodChipKey(event, 'peak_drawdown')" title="위험자산 최고점 대비 하락률">
                 <span class="chip-term" style="color:var(--profit-negative);">고점대비</span>
                 <span class="chip-rate num" id="ret_risk_peak_drawdown" style="color:var(--profit-negative);">-0.00%</span>
               </div>
-              <div class="period-chip chip-sm" title="위험자산 최저점 대비 반등률">
+              <div class="period-chip chip-sm" data-period="trough_gain" data-period-key="trough_gain" role="button" tabindex="0" onclick="selectAttributionPeriod('trough_gain')" onkeydown="handlePeriodChipKey(event, 'trough_gain')" title="위험자산 최저점 대비 반등률">
                 <span class="chip-term" style="color:var(--profit-positive);">저점대비</span>
                 <span class="chip-rate num" id="ret_risk_trough_gain" style="color:var(--profit-positive);">+0.00%</span>
               </div>
@@ -1738,6 +2364,61 @@ html_content = r'''<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- 🔍 기간별 급등·급락 원인 분석 패널 (기능 1) -->
+    <section class="attribution-panel card-panel" id="attributionPanel">
+      <div class="attr-panel-header">
+        <div class="attr-title-row">
+          <div class="attr-title-left">
+            <span class="attr-title-text">🔍 기간별 급등·급락 원인 분석</span>
+            <div class="attr-header-meta" id="attrHeaderMeta"></div>
+          </div>
+          <button type="button" class="attr-collapse-btn" id="attrCollapseBtn" onclick="toggleAttributionCollapse()" aria-expanded="true" aria-controls="attrPanelBody">접기 ▴</button>
+        </div>
+        <div class="attr-period-pills" id="attrPeriodPills" role="tablist" aria-label="원인 분석 기간 선택">
+          <button type="button" class="attr-period-pill attr-active active" data-period="1D" data-period-key="1D" onclick="selectAttributionPeriod('1D')">1D</button>
+          <button type="button" class="attr-period-pill" data-period="1W" data-period-key="1W" onclick="selectAttributionPeriod('1W')">1W</button>
+          <button type="button" class="attr-period-pill" data-period="1M" data-period-key="1M" onclick="selectAttributionPeriod('1M')">1M</button>
+          <button type="button" class="attr-period-pill" data-period="3M" data-period-key="3M" onclick="selectAttributionPeriod('3M')">3M</button>
+          <button type="button" class="attr-period-pill" data-period="6M" data-period-key="6M" onclick="selectAttributionPeriod('6M')">6M</button>
+          <button type="button" class="attr-period-pill" data-period="YTD" data-period-key="YTD" onclick="selectAttributionPeriod('YTD')">YTD</button>
+          <button type="button" class="attr-period-pill" data-period="1Y" data-period-key="1Y" onclick="selectAttributionPeriod('1Y')">1Y</button>
+          <button type="button" class="attr-period-pill" data-period="peak_drawdown" data-period-key="peak_drawdown" onclick="selectAttributionPeriod('peak_drawdown')">고점대비</button>
+          <button type="button" class="attr-period-pill" data-period="trough_gain" data-period-key="trough_gain" onclick="selectAttributionPeriod('trough_gain')">저점대비</button>
+        </div>
+      </div>
+
+      <div id="attrPanelBody">
+        <div class="attr-auto-summary" id="attrAutoSummary">원인 분석 데이터를 불러오는 중...</div>
+        <div class="attr-trade-notice" id="attrTradeNotice" style="display:none;"></div>
+
+        <div class="attr-movers-grid">
+          <div class="attr-movers-card attr-draggers-card">
+            <div class="attr-movers-card-title">
+              <span style="color:var(--profit-negative);">📉 하락 주범 Top 5 (Draggers)</span>
+              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrDraggersUnit">일정 보유수량 기준</span>
+            </div>
+            <div class="attr-movers-list" id="attrDraggersList"></div>
+          </div>
+
+          <div class="attr-movers-card attr-leaders-card">
+            <div class="attr-movers-card-title">
+              <span style="color:var(--profit-positive);">📈 상승·방어 주역 Top 5 (Leaders)</span>
+              <span style="font-size:0.71rem; color:var(--text-muted);" id="attrLeadersUnit">일정 보유수량 기준</span>
+            </div>
+            <div class="attr-movers-list" id="attrLeadersList"></div>
+          </div>
+        </div>
+
+        <div class="attr-factors-wrap">
+          <div class="attr-factors-title">
+            <span>🧩 6대 테마·매크로 팩터 기여도</span>
+            <span style="font-size:0.72rem; font-weight:500; color:var(--text-muted);" id="attrFactorsSub">5대 자산군 가격 + 환율(FX) 분리 무중복 합산</span>
+          </div>
+          <div class="attr-factors-grid" id="attrFactorsGrid"></div>
+        </div>
+      </div>
+    </section>
 
     <!-- 📈 YTD 자산 수익률 추이 인터랙티브 차트 (Requirement 3) -->
     <div class="chart-panel-ytd">
@@ -1773,6 +2454,7 @@ html_content = r'''<!DOCTYPE html>
         <span class="hover-banner-item hover-item-nav">💰 순자산 총액: <strong id="hoverNav" class="num" style="color:var(--accent-sky);">₩ 1,080,589,055 (10.81억)</strong></span>
         <span class="hover-banner-item hover-item-return">📈 기간 수익률: <strong id="hoverReturn" class="num" style="color:var(--profit-positive);">+15.96%</strong></span>
         <span class="hover-banner-badge" id="hoverSnapshotBadge">● 일별 실자산 스냅샷</span>
+        <div class="hover-movers-row" id="hoverMoversRow"></div>
       </div>
 
       <div class="svg-chart-container" id="svgChartWrap">
@@ -1881,7 +2563,16 @@ html_content = r'''<!DOCTYPE html>
         <span>📑 보유 자산 원장 (`Assets`)</span>
         <span style="font-size:0.8rem; font-weight:500; color:var(--text-muted);" id="tableCountBadge">종목 로딩중</span>
       </div>
-      <div style="display:flex; gap:8px; align-items:center;">
+      <div class="assets-table-controls">
+        <div class="assets-table-period-tabs" id="assetsTablePeriodTabs" role="tablist" aria-label="원장 손익 기준 기간">
+          <button type="button" class="table-period-btn active" data-term="cumulative" onclick="setAssetsTablePeriod('cumulative')">누적 손익(기본)</button>
+          <button type="button" class="table-period-btn" data-term="1D" onclick="setAssetsTablePeriod('1D')">1D 오늘</button>
+          <button type="button" class="table-period-btn" data-term="1W" onclick="setAssetsTablePeriod('1W')">1W 1주</button>
+          <button type="button" class="table-period-btn" data-term="1M" onclick="setAssetsTablePeriod('1M')">1M 1개월</button>
+          <button type="button" class="table-period-btn" data-term="3M" onclick="setAssetsTablePeriod('3M')">3M 3개월</button>
+          <button type="button" class="table-period-btn" data-term="YTD" onclick="setAssetsTablePeriod('YTD')">YTD</button>
+          <button type="button" class="table-period-btn" data-term="peak_drawdown" onclick="setAssetsTablePeriod('peak_drawdown')">고점대비(MDD)</button>
+        </div>
         <input type="text" class="search-input" id="tableSearch" placeholder="🔍 종목명, 티커, 계좌명, 태그 검색..." oninput="filterAssetsTable()">
       </div>
     </div>
@@ -1898,8 +2589,8 @@ html_content = r'''<!DOCTYPE html>
             <th onclick="sortTable('buy_price')" style="text-align:right;">매수단가 <span class="sort-icon" id="sort_buy_price">↕</span></th>
             <th onclick="sortTable('current_price')" style="text-align:right;">현재가 <span class="sort-icon" id="sort_current_price">↕</span></th>
             <th onclick="sortTable('valuation_krw')" style="text-align:right;">평가금액(KRW) <span class="sort-icon" id="sort_valuation_krw">▲</span></th>
-            <th onclick="sortTable('profit_krw')" style="text-align:right;">평가손익(KRW) <span class="sort-icon" id="sort_profit_krw">↕</span></th>
-            <th onclick="sortTable('return_rate')" style="text-align:right;">수익률 <span class="sort-icon" id="sort_return_rate">↕</span></th>
+            <th onclick="sortTable('profit_krw')" style="text-align:right;"><span id="thProfitLabel">평가손익(KRW)</span> <span class="sort-icon" id="sort_profit_krw">↕</span></th>
+            <th onclick="sortTable('return_rate')" style="text-align:right;"><span id="thReturnLabel">수익률</span> <span class="sort-icon" id="sort_return_rate">↕</span></th>
             <th onclick="sortTable('maturity_date')">만기일/이율 <span class="sort-icon" id="sort_maturity_date">↕</span></th>
           </tr>
         </thead>
@@ -2290,6 +2981,7 @@ html_content = r'''<!DOCTYPE html>
 
       renderHeroSummary();
       updateHistoryViewData();
+      if (typeof renderAttributionPanel === "function") renderAttributionPanel();
       renderMultiGrid();
       if (typeof renderAlerts === "function") renderAlerts();
       if (typeof renderAssetsTable === "function") renderAssetsTable();
@@ -2310,6 +3002,7 @@ html_content = r'''<!DOCTYPE html>
 
       renderHeroSummary();
       updateHistoryViewData();
+      if (typeof renderAttributionPanel === "function") renderAttributionPanel();
       renderMultiGrid();
       renderAlerts();
       renderAssetsTable();
@@ -2328,6 +3021,451 @@ html_content = r'''<!DOCTYPE html>
     // 시계열 차트 데이터 및 모드 상태 (366일 실제 일봉 데이터 프리로드)
     const DEFAULT_HISTORY_CACHE = ''' + history_raw + r''';
     const EMBEDDED_TRANSACTIONS = ''' + transactions_raw + r''';
+    const EMBEDDED_ATTRIBUTION_DATA = ''' + attribution_raw + r''';
+    const DEFAULT_ATTRIBUTION_CACHE = EMBEDDED_ATTRIBUTION_DATA;
+
+    let attributionServerData = null;
+    let attributionData = EMBEDDED_ATTRIBUTION_DATA;
+    let currentAttrPeriod = "1D";
+    let isAttrPanelCollapsed = false;
+    let currentTablePeriod = "cumulative";
+
+    const ATTR_SCENARIO_LABELS = {
+      all: "연금포함 전체",
+      no_pension: "연금제외",
+      risk_only: "위험자산 (연금포함)",
+      risk_no_pension: "위험자산 (연금제외)"
+    };
+    const TABLE_PERIOD_LABELS = {
+      cumulative: ["평가손익(KRW)", "수익률"],
+      "1D": ["1D 변동액(KRW)", "1D 등락률"],
+      "1W": ["1W 변동액(KRW)", "1W 등락률"],
+      "1M": ["1M 변동액(KRW)", "1M 등락률"],
+      "3M": ["3M 변동액(KRW)", "3M 등락률"],
+      YTD: ["YTD 변동액(KRW)", "YTD 등락률"],
+      peak_drawdown: ["고점대비 변동액(KRW)", "고점대비 등락률"]
+    };
+
+    function escapeAttrHtml(str) {
+      return String(str === null || str === undefined ? "" : str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function formatSignedExactKrw(val) {
+      const n = Math.round(Number(val || 0));
+      if (n === 0) return "₩ 0";
+      return `${n > 0 ? "+" : "-"}₩ ${Math.abs(n).toLocaleString("ko-KR")}`;
+    }
+
+    function formatSignedCompactKrw(val) {
+      const n = Math.round(Number(val || 0));
+      if (n === 0) return "₩0";
+      const sign = n > 0 ? "+" : "-";
+      const abs = Math.abs(n);
+      if (abs >= 100000000) {
+        const eok = Math.floor(abs / 100000000);
+        const man = Math.round((abs % 100000000) / 10000);
+        return man > 0 ? `${sign}${eok}억 ${man.toLocaleString("ko-KR")}만` : `${sign}${eok}억`;
+      }
+      if (abs >= 10000) {
+        return `${sign}${Math.round(abs / 10000).toLocaleString("ko-KR")}만`;
+      }
+      return `${sign}₩${abs.toLocaleString("ko-KR")}`;
+    }
+
+    function formatUnsignedCompactKrw(val) {
+      const abs = Math.abs(Math.round(Number(val || 0)));
+      if (abs === 0) return "₩0";
+      if (abs >= 100000000) {
+        const eok = Math.floor(abs / 100000000);
+        const man = Math.round((abs % 100000000) / 10000);
+        return man > 0 ? `₩${eok}억 ${man.toLocaleString("ko-KR")}만` : `₩${eok}억`;
+      }
+      if (abs >= 10000) {
+        return `₩${Math.round(abs / 10000).toLocaleString("ko-KR")}만`;
+      }
+      return `₩${abs.toLocaleString("ko-KR")}`;
+    }
+
+    function formatSignedPct(val, digits = 2) {
+      const n = Number(val || 0);
+      const sign = n > 0 ? "+" : "";
+      return `${sign}${n.toFixed(digits)}%`;
+    }
+
+    function shortHoverName(name) {
+      const clean = String(name || "").replace(/\s*\([^)]*\)\s*$/, "").trim() || String(name || "");
+      return clean.length > 12 ? clean.slice(0, 12) + "…" : clean;
+    }
+
+    function getActiveAttributionScenarioKey() {
+      if (includePension && !onlyRiskAssets) return "all";
+      if (!includePension && !onlyRiskAssets) return "no_pension";
+      if (includePension && onlyRiskAssets) return "risk_only";
+      return "risk_no_pension";
+    }
+
+    function getAttributionRoot() {
+      return attributionServerData || attributionData || (typeof DEFAULT_ATTRIBUTION_CACHE !== "undefined" ? DEFAULT_ATTRIBUTION_CACHE : null);
+    }
+
+    function getAttributionScenarioData(scenarioKey) {
+      const root = getAttributionRoot();
+      if (!root || !root.scenarios) return null;
+      const key = scenarioKey || getActiveAttributionScenarioKey();
+      return root.scenarios[key] || root.scenarios.all || null;
+    }
+
+    function getDailyMover(dateStr, scenarioKey) {
+      if (!dateStr) return null;
+      const sc = getAttributionScenarioData(scenarioKey);
+      return (sc && sc.daily_movers && sc.daily_movers[dateStr]) ? sc.daily_movers[dateStr] : null;
+    }
+
+    function getAssetAttr(assetId, periodKey) {
+      if (!assetId || !periodKey || periodKey === "cumulative") return null;
+      const root = getAttributionRoot();
+      const scAll = root && root.scenarios ? root.scenarios.all : null;
+      const pObj = scAll && scAll.periods ? scAll.periods[periodKey] : null;
+      return (pObj && pObj.by_asset && pObj.by_asset[assetId]) ? pObj.by_asset[assetId] : null;
+    }
+
+    async function fetchAttributionData(forceRefresh = false) {
+      try {
+        const qs = forceRefresh ? "?refresh=1" : "";
+        const res = await fetch(`${API_BASE}/api/attribution${qs}`, { mode: "cors", cache: "no-cache" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.scenarios) {
+            attributionServerData = data;
+            attributionData = data;
+            renderAttributionPanel();
+            renderYtdSvgChart();
+            if (currentTablePeriod !== "cumulative") {
+              renderAssetsTable();
+            }
+          }
+        }
+      } catch (e) {
+        // 오프라인 / file:// 실행 시 내장 EMBEDDED_ATTRIBUTION_DATA 유지
+      }
+    }
+
+    function syncPeriodHighlight(periodKey) {
+      if (typeof document === "undefined" || typeof document.querySelectorAll !== "function") return;
+      const key = periodKey || currentAttrPeriod || "1D";
+      const chips = document.querySelectorAll("#periodReturnsStrip .period-chip");
+      if (chips && typeof chips.forEach === "function") {
+        chips.forEach(chip => {
+          const p = (typeof chip.getAttribute === "function") ? (chip.getAttribute("data-period") || chip.getAttribute("data-period-key")) : null;
+          if (chip.classList) chip.classList.toggle("attr-active", p === key);
+          if (typeof chip.setAttribute === "function") chip.setAttribute("aria-pressed", p === key ? "true" : "false");
+        });
+      }
+      const pills = document.querySelectorAll("#attrPeriodPills .attr-period-pill");
+      if (pills && typeof pills.forEach === "function") {
+        pills.forEach(pill => {
+          const p = (typeof pill.getAttribute === "function") ? (pill.getAttribute("data-period") || pill.getAttribute("data-period-key")) : null;
+          const active = (p === key);
+          if (pill.classList) {
+            pill.classList.toggle("attr-active", active);
+            pill.classList.toggle("active", active);
+          }
+          if (typeof pill.setAttribute === "function") pill.setAttribute("aria-selected", active ? "true" : "false");
+        });
+      }
+    }
+
+    function handlePeriodChipKey(ev, periodKey) {
+      if (!ev) return;
+      if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+        if (typeof ev.preventDefault === "function") ev.preventDefault();
+        selectAttributionPeriod(periodKey);
+      }
+    }
+
+    function selectAttributionPeriod(periodKey) {
+      currentAttrPeriod = periodKey || "1D";
+      if (isAttrPanelCollapsed) {
+        isAttrPanelCollapsed = false;
+        const body = document.getElementById("attrPanelBody");
+        const btn = document.getElementById("attrCollapseBtn");
+        if (body) body.style.display = "block";
+        if (btn) {
+          btn.innerText = "접기 ▴";
+          if (typeof btn.setAttribute === "function") btn.setAttribute("aria-expanded", "true");
+        }
+      }
+      syncPeriodHighlight(currentAttrPeriod);
+      renderAttributionPanel();
+    }
+
+    function toggleAttributionCollapse() {
+      isAttrPanelCollapsed = !isAttrPanelCollapsed;
+      const body = document.getElementById("attrPanelBody");
+      const btn = document.getElementById("attrCollapseBtn");
+      if (body) body.style.display = isAttrPanelCollapsed ? "none" : "block";
+      if (btn) {
+        btn.innerText = isAttrPanelCollapsed ? "펼치기 ▾" : "접기 ▴";
+        if (typeof btn.setAttribute === "function") {
+          btn.setAttribute("aria-expanded", isAttrPanelCollapsed ? "false" : "true");
+        }
+      }
+    }
+
+    function renderAttrMoversColumn(containerEl, items, kind, fallbackInfo) {
+      if (!containerEl) return;
+      const list = Array.isArray(items) ? items : [];
+      const isRefFallback = !!(fallbackInfo && fallbackInfo.isFallback);
+      const isDragger = (kind === "dragger");
+
+      if (list.length === 0) {
+        containerEl.innerHTML = `<div class="attr-empty-state">${
+          isDragger
+            ? "해당 기간 내 유의미한 하락 기여 종목이 없습니다."
+            : "해당 기간 내 유의미한 상승 기여 종목이 없습니다."
+        }</div>`;
+        return;
+      }
+
+      const maxAbs = Math.max(...list.map(x => Math.abs(Number(x.delta_krw || 0))), 1);
+      const headerBanner = isRefFallback
+        ? `<div style="font-size:0.71rem; color:var(--text-muted); margin-bottom:2px;">⏸️ 당일 휴장(변동 0원) — 참고: 직전 거래일(<strong>${escapeAttrHtml(fallbackInfo.date)}</strong>) 변동</div>`
+        : "";
+
+      const rowsHtml = list.map((item, idx) => {
+        const dKrw = Number(item.delta_krw || 0);
+        const dPct = Number(item.delta_pct || 0);
+        const barW = Math.min(100, Math.max(4, (Math.abs(dKrw) / maxAbs) * 100)).toFixed(1);
+        const barCls = dKrw < 0 ? "neg" : "pos";
+        const valCls = dKrw < 0 ? "pnl-minus" : (dKrw > 0 ? "pnl-plus" : "");
+        const acctAsset = (typeof activeAssets !== "undefined" && Array.isArray(activeAssets))
+          ? activeAssets.find(x => x.id === item.asset_id)
+          : null;
+        const acctTxt = acctAsset
+          ? `${acctAsset.institution} · ${acctAsset.account_name}`
+          : (item.category || "");
+        const url = acctAsset && typeof getAssetMarketUrl === "function" ? getAssetMarketUrl(acctAsset) : null;
+        const nameDisplay = url
+          ? `<a href="${url}" target="_blank" rel="noopener noreferrer" class="asset-link attr-mover-name" title="${escapeAttrHtml(item.name || "")}">${escapeAttrHtml(item.name || "")}</a>`
+          : `<span class="attr-mover-name" title="${escapeAttrHtml(item.name || "")}">${escapeAttrHtml(item.name || "")}</span>`;
+        const validTicker = item.ticker && !String(item.ticker).startsWith("DEP-") && !String(item.ticker).startsWith("CASH-") && !String(item.ticker).startsWith("RP-");
+        const tickerHtml = validTicker ? `<span style="font-size:0.66rem; color:var(--accent-sky);">(${escapeAttrHtml(item.ticker)})</span>` : "";
+
+        let metaParts = [formatSignedPct(dPct, 2)];
+        if (item.contrib_pct !== undefined && item.contrib_pct !== null && Math.abs(Number(item.contrib_pct)) <= 500) {
+          metaParts.push(`기여 ${formatSignedPct(item.contrib_pct, 1)}`);
+        }
+        if (item.contrib_pp !== undefined && item.contrib_pp !== null) {
+          metaParts.push(`${formatSignedPct(item.contrib_pp, 2)}p`);
+        }
+
+        const subParts = [];
+        if (item.currency && item.currency !== "KRW" && item.price_delta_krw !== undefined) {
+          subParts.push(`<span>${escapeAttrHtml(item.currency)} 시세 ${formatSignedCompactKrw(item.price_delta_krw)} / 환율 ${formatSignedCompactKrw(item.fx_delta_krw || 0)}</span>`);
+        }
+        if (item.factor_label) {
+          subParts.push(`<span>${escapeAttrHtml(item.factor_label)}</span>`);
+        }
+        if (item.is_bfill_estimated) {
+          subParts.push(`<span>(역산 추정 포함)</span>`);
+        }
+
+        return `
+          <div class="attr-mover-row${isRefFallback ? " ref-fallback" : ""}">
+            <div class="attr-mover-top">
+              <div class="attr-mover-left">
+                <span class="attr-mover-rank">${idx + 1}</span>
+                ${nameDisplay}
+                ${tickerHtml}
+                ${acctTxt ? `<span class="attr-acct-badge" title="${escapeAttrHtml(acctTxt)}">${escapeAttrHtml(acctTxt)}</span>` : ""}
+              </div>
+              <div class="attr-mover-right">
+                <div class="attr-mover-delta ${valCls}">${formatSignedExactKrw(dKrw)}</div>
+                <div class="attr-mover-meta">${metaParts.join(" · ")}</div>
+              </div>
+            </div>
+            <div class="attr-bar-track"><div class="attr-bar-fill ${barCls}" style="width:${barW}%;"></div></div>
+            ${subParts.length > 0 ? `<div class="attr-mover-sub">${subParts.join("")}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+
+      containerEl.innerHTML = headerBanner + rowsHtml;
+    }
+
+    function renderAttributionPanel() {
+      syncPeriodHighlight(currentAttrPeriod);
+      const panel = document.getElementById("attributionPanel");
+      if (!panel) return;
+
+      const metaEl = document.getElementById("attrHeaderMeta");
+      const summaryEl = document.getElementById("attrAutoSummary");
+      const tradeEl = document.getElementById("attrTradeNotice");
+      const draggersEl = document.getElementById("attrDraggersList");
+      const leadersEl = document.getElementById("attrLeadersList");
+      const factorsEl = document.getElementById("attrFactorsGrid");
+      const draggersUnitEl = document.getElementById("attrDraggersUnit");
+      const leadersUnitEl = document.getElementById("attrLeadersUnit");
+
+      const scKey = getActiveAttributionScenarioKey();
+      const scObj = getAttributionScenarioData(scKey);
+      const pData = scObj && scObj.periods ? scObj.periods[currentAttrPeriod] : null;
+
+      if (!pData) {
+        if (metaEl) metaEl.innerHTML = "";
+        if (summaryEl) summaryEl.innerText = "선택한 기간의 원인 분석 데이터가 아직 생성되지 않았습니다.";
+        if (tradeEl) tradeEl.style.display = "none";
+        if (draggersEl) draggersEl.innerHTML = `<div class="attr-empty-state">데이터 없음</div>`;
+        if (leadersEl) leadersEl.innerHTML = `<div class="attr-empty-state">데이터 없음</div>`;
+        if (factorsEl) factorsEl.innerHTML = "";
+        return;
+      }
+
+      const attrDelta = Number(pData.attr_delta_krw || 0);
+      const attrRet = Number(pData.attr_return_pct || 0);
+      const attrCls = attrDelta > 0 ? "pos" : (attrDelta < 0 ? "neg" : "");
+      const scLabel = (scObj && scObj.label) || ATTR_SCENARIO_LABELS[scKey] || scKey;
+
+      if (metaEl) {
+        const metaBadges = [
+          `<span class="attr-meta-badge scenario">${escapeAttrHtml(scLabel)} (${scObj.asset_count || 0}종)</span>`,
+          `<span class="attr-meta-badge">📅 ${escapeAttrHtml(pData.d_start || "")} → ${escapeAttrHtml(pData.d_end || "")}</span>`,
+          `<span class="attr-meta-badge ${attrCls}">시세 변동 ${formatSignedExactKrw(attrDelta)} (${formatSignedPct(attrRet)})</span>`
+        ];
+        if (pData.is_market_closed_day && pData.fallback_trading_date) {
+          metaBadges.push(`<span class="attr-meta-badge">⏸️ 직전 거래일 ${escapeAttrHtml(pData.fallback_trading_date)} 기준</span>`);
+        }
+        metaEl.innerHTML = metaBadges.join("");
+      }
+
+      if (summaryEl) {
+        const badges = [];
+        if (pData.is_market_closed_day) {
+          const fbTxt = pData.fallback_trading_date ? `직전 거래일 ${escapeAttrHtml(pData.fallback_trading_date)} 기준` : "직전 거래일 종가 유지";
+          badges.push(`<span class="attr-meta-badge">⏸️ 휴장일 (${fbTxt})</span>`);
+          badges.push(`<button type="button" class="attr-quick-btn" onclick="selectAttributionPeriod('1W')">최근 1주(1W) 보기 →</button>`);
+        } else if (pData.is_near_flat_net) {
+          badges.push(`<span class="attr-meta-badge">⚖️ 순변동 보합 (상승·하락 종목 상쇄)</span>`);
+        }
+        badges.push(`<span class="attr-meta-badge">시계열 NAV: ${formatSignedCompactKrw(pData.nav_delta_krw)} (${formatSignedPct(pData.period_return_pct)})</span>`);
+        badges.push(`<span class="attr-meta-badge">시세·환율 합계: ${formatSignedCompactKrw(attrDelta)} (가격 ${formatSignedCompactKrw(pData.total_price_delta_krw)} / 환율 ${formatSignedCompactKrw(pData.total_fx_delta_krw)})</span>`);
+        if (Math.abs(Number(pData.residual_krw || 0)) >= 10000) {
+          badges.push(`<span class="attr-meta-badge">매매·입출금 잔차: ${formatSignedCompactKrw(pData.residual_krw)}</span>`);
+        }
+        summaryEl.innerHTML = `
+          <div>${escapeAttrHtml(pData.auto_summary || "원인 요약 정보 없음")}</div>
+          <div class="attr-summary-badges">${badges.join("")}</div>
+        `;
+      }
+
+      if (tradeEl) {
+        const trades = Array.isArray(pData.recent_trades) ? pData.recent_trades : [];
+        if (trades.length > 0) {
+          const showTrades = trades.slice(0, 5);
+          const extraCnt = trades.length - showTrades.length;
+          const itemsHtml = showTrades.map(t => {
+            const typeBadge = t.trade_type === "BUY" ? "매수" : "매도";
+            return `<div class="attr-trade-notice-item">• <strong>${escapeAttrHtml(t.date)}</strong> [${escapeAttrHtml(t.asset_name || t.asset_id || "")}] ${typeBadge} — ${escapeAttrHtml(t.note || "내부 거래로 시세 급등락 주범 오탐에서 제외됨")}</div>`;
+          }).join("") + (extraCnt > 0 ? `<div class="attr-trade-notice-item">• 외 ${extraCnt}건의 매매·이체 내역이 시세 변동 오탐 방지를 위해 제외되었습니다.</div>` : "");
+          tradeEl.innerHTML = `
+            <div class="attr-trade-notice-title">ℹ️ 기간 내 내부 이체·RP 롤오버·매매 안내 (${trades.length}건 · 시세 급등락 오탐 제외)</div>
+            <div class="attr-trade-notice-list">${itemsHtml}</div>
+          `;
+          tradeEl.style.display = "block";
+        } else {
+          tradeEl.style.display = "none";
+          tradeEl.innerHTML = "";
+        }
+      }
+
+      let draggersList = Array.isArray(pData.top_draggers) ? pData.top_draggers : [];
+      let leadersList = Array.isArray(pData.top_leaders) ? pData.top_leaders : [];
+      let fallbackInfo = null;
+
+      if (pData.is_market_closed_day && draggersList.length === 0 && leadersList.length === 0 && pData.fallback_trading_date) {
+        const fbDm = getDailyMover(pData.fallback_trading_date, scKey);
+        if (fbDm && !fbDm.is_flat_day) {
+          draggersList = Array.isArray(fbDm.top_draggers) ? fbDm.top_draggers : [];
+          leadersList = Array.isArray(fbDm.top_leaders) ? fbDm.top_leaders : [];
+          fallbackInfo = { isFallback: true, date: pData.fallback_trading_date };
+        }
+      }
+
+      if (draggersUnitEl) draggersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "일정 보유수량 기준";
+      if (leadersUnitEl) leadersUnitEl.innerText = fallbackInfo ? `참고: ${fallbackInfo.date}` : "일정 보유수량 기준";
+
+      renderAttrMoversColumn(draggersEl, draggersList, "dragger", fallbackInfo);
+      renderAttrMoversColumn(leadersEl, leadersList, "leader", fallbackInfo);
+
+      if (factorsEl) {
+        const factors = Array.isArray(pData.factors) ? pData.factors : [];
+        if (factors.length === 0) {
+          factorsEl.innerHTML = `<div class="attr-empty-state">팩터 요약 데이터가 없습니다.</div>`;
+        } else {
+          const maxF = Math.max(...factors.map(f => Math.abs(Number(f.delta_krw || 0))), 1);
+          factorsEl.innerHTML = factors.map(f => {
+            const fd = Number(f.delta_krw || 0);
+            const fCls = fd > 0 ? "pnl-plus" : (fd < 0 ? "pnl-minus" : "");
+            const barCls = fd < 0 ? "neg" : "pos";
+            const barW = fd === 0 ? "0.0" : Math.min(100, Math.max(5, (Math.abs(fd) / maxF) * 100)).toFixed(1);
+            const ppTxt = `기여 ${formatSignedPct(f.contrib_pp || 0, 2)}p`;
+            const leftSub = f.is_fx_overlay
+              ? `USD ${formatSignedCompactKrw(f.usd_fx_delta_krw || 0)} · JPY ${formatSignedCompactKrw(f.jpy_fx_delta_krw || 0)}`
+              : `노출 ${formatUnsignedCompactKrw(f.exposure_krw)}`;
+            const rightSub = (f.contrib_pct !== undefined && f.contrib_pct !== null && Math.abs(Number(f.contrib_pct)) <= 500)
+              ? `비중 ${formatSignedPct(f.contrib_pct, 1)}`
+              : `노출 ${formatUnsignedCompactKrw(f.exposure_krw)}`;
+            return `
+              <div class="attr-factor-card${f.is_fx_overlay ? " fx-overlay" : ""}">
+                <div class="attr-factor-head">
+                  <span class="attr-factor-label">${escapeAttrHtml(f.icon || "")} ${escapeAttrHtml(f.label || f.factor_id)}</span>
+                  <span style="font-size:0.68rem; color:var(--text-muted); font-weight:600; flex-shrink:0;">${f.asset_count || 0}종</span>
+                </div>
+                <div class="attr-factor-val-row">
+                  <span class="num ${fCls}" style="font-size:0.86rem; font-weight:700;">${formatSignedExactKrw(fd)}</span>
+                  <span class="num" style="font-size:0.71rem; color:var(--text-muted);">${ppTxt}</span>
+                </div>
+                <div class="attr-bar-track"><div class="attr-bar-fill ${barCls}" style="width:${barW}%;"></div></div>
+                <div class="attr-factor-sub">
+                  <span>${leftSub}</span>
+                  <span>${f.is_fx_overlay ? `외화노출 ${formatUnsignedCompactKrw(f.exposure_krw)}` : rightSub}</span>
+                </div>
+              </div>
+            `;
+          }).join("");
+        }
+      }
+    }
+
+    function syncAssetsTableHeaders() {
+      const pair = TABLE_PERIOD_LABELS[currentTablePeriod] || TABLE_PERIOD_LABELS.cumulative;
+      const thP = document.getElementById("thProfitLabel");
+      const thR = document.getElementById("thReturnLabel");
+      if (thP) thP.innerText = pair[0];
+      if (thR) thR.innerText = pair[1];
+      if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
+        const btns = document.querySelectorAll("#assetsTablePeriodTabs .table-period-btn");
+        if (btns && typeof btns.forEach === "function") {
+          btns.forEach(btn => {
+            const term = (typeof btn.getAttribute === "function") ? btn.getAttribute("data-term") : null;
+            const active = (term === currentTablePeriod);
+            if (btn.classList) btn.classList.toggle("active", active);
+            if (typeof btn.setAttribute === "function") btn.setAttribute("aria-selected", active ? "true" : "false");
+          });
+        }
+      }
+    }
+
+    function setAssetsTablePeriod(term) {
+      currentTablePeriod = term || "cumulative";
+      syncAssetsTableHeaders();
+      renderAssetsTable();
+    }
     let currentTransactions = null;
     let tradesCollapsed = true;
     let lastFocusedTrigger = null;
@@ -3089,6 +4227,7 @@ html_content = r'''<!DOCTYPE html>
       renderAll();
       checkLiveServerHealth();
       fetchHistoryData();
+      fetchAttributionData();
 
       // 자동 15분 주기 시세 갱신 타이머 연결
       setInterval(updateLivePrices, 15 * 60 * 1000);
@@ -3207,6 +4346,7 @@ html_content = r'''<!DOCTYPE html>
 
       document.getElementById("lastUpdateDateTime").innerText = formatDateTime();
       fetchHistoryData();
+      fetchAttributionData(serverSuccess);
       fetchTransactions();
 
       btn.disabled = false;
@@ -3700,6 +4840,42 @@ html_content = r'''<!DOCTYPE html>
           }
           if (badgeTextEl) badgeTextEl.innerText = p.is_real_snapshot ? "● 일별 실자산 스냅샷" : "○ 과거 시세 역산치";
         }
+        const moversEl = document.getElementById("hoverMoversRow");
+        if (moversEl) {
+          const dm = (typeof getDailyMover === "function") ? getDailyMover(p.date) : null;
+          if (!dm) {
+            moversEl.innerHTML = `<span class="hover-mover-empty">해당 일자(${escapeAttrHtml(p.date)}) 종목별 기여 데이터 없음</span>`;
+          } else if (dm.is_flat_day) {
+            const noteTxt = dm.note ? escapeAttrHtml(dm.note) : "휴장일 (시세 변동 없음)";
+            moversEl.innerHTML = `<span class="hover-mover-flat">⏸️ ${noteTxt} · 직전 거래일 종가 유지</span>`;
+          } else {
+            const dayDelta = Number(dm.day_delta_krw || 0);
+            const dayRet = Number(dm.day_return_pct || 0);
+            const dayCls = dayDelta > 0 ? "pos" : (dayDelta < 0 ? "neg" : "");
+            const leaders = Array.isArray(dm.top_leaders) ? dm.top_leaders.slice(0, 2) : [];
+            const draggers = Array.isArray(dm.top_draggers) ? dm.top_draggers.slice(0, 2) : [];
+
+            const renderChipList = (arr, cls) => arr.map(item => {
+              const nm = escapeAttrHtml(shortHoverName(item.name));
+              const dStr = formatSignedCompactKrw(item.delta_krw);
+              const pStr = formatSignedPct(item.delta_pct, 1);
+              return `<span class="hover-mover-chip ${cls}" title="${escapeAttrHtml(item.name || "")}">${nm} ${dStr}(${pStr})</span>`;
+            }).join("");
+
+            const leadersHtml = leaders.length > 0
+              ? `<span class="hover-mover-group"><span>📈 상승 Top 2:</span>${renderChipList(leaders, "up")}</span>`
+              : "";
+            const draggersHtml = draggers.length > 0
+              ? `<span class="hover-mover-group"><span>📉 하락 Top 2:</span>${renderChipList(draggers, "down")}</span>`
+              : "";
+
+            moversEl.innerHTML = `
+              <span class="hover-day-delta ${dayCls}">전일비 ${formatSignedExactKrw(dayDelta)} (${formatSignedPct(dayRet)})</span>
+              ${leadersHtml}
+              ${draggersHtml}
+            `;
+          }
+        }
       }
 
       // 초기 상태는 최신 오늘자 포인트로 배너 표시
@@ -3773,6 +4949,7 @@ html_content = r'''<!DOCTYPE html>
       renderTradesTable();
       renderAssetsTable();
       renderYtdSvgChart();
+      if (typeof renderAttributionPanel === "function") renderAttributionPanel();
     }
 
     function renderHeroSummary() {
@@ -4585,6 +5762,7 @@ html_content = r'''<!DOCTYPE html>
     let unfilteredTableMinHeight = 0;
 
     function renderAssetsTable() {
+      if (typeof syncAssetsTableHeaders === "function") syncAssetsTableHeaders();
       const savedScrollY = (typeof window !== "undefined") ? window.scrollY : 0;
       const isSearchActive = (typeof document !== "undefined") && document.activeElement && document.activeElement.id === "tableSearch";
       const tableContainer = (typeof document !== "undefined" && typeof document.querySelector === "function") ? (document.querySelector("#assetsTable")?.closest ? document.querySelector("#assetsTable").closest(".table-container") : null) : null;
@@ -4630,6 +5808,26 @@ html_content = r'''<!DOCTYPE html>
         } else if (currentSortKey === "institution_account") {
           valA = `${a.institution} ${a.account_name}`;
           valB = `${b.institution} ${b.account_name}`;
+        } else if (currentSortKey === "profit_krw") {
+          if (currentTablePeriod !== "cumulative" && typeof getAssetAttr === "function") {
+            const arA = getAssetAttr(a.id, currentTablePeriod);
+            const arB = getAssetAttr(b.id, currentTablePeriod);
+            valA = arA ? Number(arA.delta_krw || 0) : 0;
+            valB = arB ? Number(arB.delta_krw || 0) : 0;
+          } else {
+            valA = a.profit_krw;
+            valB = b.profit_krw;
+          }
+        } else if (currentSortKey === "return_rate") {
+          if (currentTablePeriod !== "cumulative" && typeof getAssetAttr === "function") {
+            const arA = getAssetAttr(a.id, currentTablePeriod);
+            const arB = getAssetAttr(b.id, currentTablePeriod);
+            valA = arA ? Number(arA.delta_pct || 0) : 0;
+            valB = arB ? Number(arB.delta_pct || 0) : 0;
+          } else {
+            valA = a.return_rate;
+            valB = b.return_rate;
+          }
         } else {
           valA = a[currentSortKey];
           valB = b[currentSortKey];
@@ -4664,8 +5862,33 @@ html_content = r'''<!DOCTYPE html>
 
       filtered.forEach((a, idx) => {
         const tr = document.createElement("tr");
-        const profitClass = a.profit_krw > 0 ? "pnl-plus" : (a.profit_krw < 0 ? "pnl-minus" : "");
+        let profitClass = a.profit_krw > 0 ? "pnl-plus" : (a.profit_krw < 0 ? "pnl-minus" : "");
+        let returnClass = profitClass;
         const sign = a.profit_krw > 0 ? "+" : "";
+        let profitCellHtml = `${sign}₩ ${Math.round(a.profit_krw).toLocaleString()}`;
+        let returnCellHtml = `${sign}${a.return_rate.toFixed(2)}%`;
+
+        if (currentTablePeriod !== "cumulative" && typeof getAssetAttr === "function") {
+          const attrRow = getAssetAttr(a.id, currentTablePeriod);
+          if (attrRow) {
+            const dKrw = Number(attrRow.delta_krw || 0);
+            const dPct = Number(attrRow.delta_pct || 0);
+            profitClass = dKrw > 0 ? "pnl-plus" : (dKrw < 0 ? "pnl-minus" : "");
+            returnClass = dPct > 0 ? "pnl-plus" : (dPct < 0 ? "pnl-minus" : "");
+            const fxDelta = Number(attrRow.fx_delta_krw || 0);
+            const fxSub = (a.currency && a.currency !== "KRW" && Math.abs(fxDelta) >= 100)
+              ? `<div class="table-sub-meta">환율 ${formatSignedCompactKrw(fxDelta)}</div>`
+              : "";
+            const contribSub = `<div class="table-sub-meta">기여 ${formatSignedPct(attrRow.contrib_pp || 0, 2)}p</div>`;
+            profitCellHtml = `${formatSignedExactKrw(dKrw)}${fxSub}`;
+            returnCellHtml = `${formatSignedPct(dPct, 2)}${contribSub}`;
+          } else {
+            profitClass = "";
+            returnClass = "";
+            profitCellHtml = `<span style="color:var(--text-muted);">-</span>`;
+            returnCellHtml = `<span style="color:var(--text-muted);">-</span><div class="table-sub-meta">기간 미보유</div>`;
+          }
+        }
         const url = getAssetMarketUrl(a);
 
         // 종목명 렌더링 (현금/예금/RP는 링크 없이 일반 텍스트)
@@ -4703,8 +5926,8 @@ html_content = r'''<!DOCTYPE html>
           <td class="num" style="text-align:right;">${buyPriceDisplay}</td>
           <td class="num" style="text-align:right;">${priceDisplay}</td>
           <td class="num" style="text-align:right; font-weight:700; color:var(--text-primary);">₩ ${Math.round(a.valuation_krw).toLocaleString()}</td>
-          <td class="num ${profitClass}" style="text-align:right;">${sign}₩ ${Math.round(a.profit_krw).toLocaleString()}</td>
-          <td class="num ${profitClass}" style="text-align:right;">${sign}${a.return_rate.toFixed(2)}%</td>
+          <td class="num ${profitClass}" style="text-align:right;">${profitCellHtml}</td>
+          <td class="num ${returnClass}" style="text-align:right;">${returnCellHtml}</td>
           <td style="color:var(--text-muted); font-size:11px;">${a.maturity_date || a.interest_rate || "-"}</td>
         `;
         tbody.appendChild(tr);
@@ -4995,6 +6218,7 @@ html_content = r'''<!DOCTYPE html>
     renderAll();
     checkLiveServerHealth();
     fetchHistoryData();
+    fetchAttributionData();
     fetchTransactions();
 
     // 자동 15분 주기 시세 갱신 타이머 연결
@@ -5004,7 +6228,9 @@ html_content = r'''<!DOCTYPE html>
 </html>
 '''
 
-with open("web/index.html", "w", encoding="utf-8") as f:
+os.makedirs(WEB_DIR, exist_ok=True)
+output_html_path = os.path.join(WEB_DIR, "index.html")
+with open(output_html_path, "w", encoding="utf-8") as f:
     f.write(html_content)
 
-print("web/index.html v4.4 compiled successfully with all 6 requested new features!")
+print(f"{output_html_path} v4.4 compiled successfully ({len(html_content.encode('utf-8')):,} bytes)!")

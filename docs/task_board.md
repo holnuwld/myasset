@@ -1,7 +1,18 @@
 # 자산 관리 프로그램 작업 보드 (`task_board.md`)
 
 > **관리자**: 비서 (Main Orchestrator)  
-> **문서 버전**: v5.2 진행 중 (납입원금 체계·실질손익·중복방지·월별레포트 구현)  
+> **문서 버전**: v5.3 완료 (Phase 23: 계좌 총액 급등/급락 원인 자산 기여도 분석 및 워크트리 격리 구현)  
+
+---
+
+## Phase 23 (v5.3): 계좌 총액 급등/급락 주요 원인 자산 분석 (Attribution & Top Movers) (`feat/attribution` 워크트리)
+
+| ID | 단계 및 작업 항목 | 담당 에이전트 | 상태 | 세부 내용 및 산출물 |
+| :-: | :--- | :---: | :---: | :--- |
+| **T-28-1** | **급등·급락 원인 자산 기여도 분석 설계 명세(`docs/attribution_analysis_spec.md`) 작성** | `architect` | ✅ 완료 | 전 구간(`1D`, `1W`, `1M`, `3M`, `6M`, `YTD`, `1Y`, `peak_drawdown`, `trough_gain`) × 4대 토글별 종목 단위 $\Delta\text{KRW}$, $\Delta\%$, 기여 비중($\%$), 가격/환율 분해, 6대 테마 팩터, 매매·RP 롤오버 왜곡 방지 규칙 및 텔레그램 `/원인`·UI 3종 SSoT 설계 (`docs/attribution_analysis_spec.md`, 815줄) |
+| **T-28-2** | **백엔드 기여도 분석 엔진(`src/attribution_engine.py`) 및 라이브 서버(`/api/attribution`, 텔레그램 `/원인`, 포트/폴링 격리) 구현** | `developer` | ✅ 완료 | `data/ticker_history_cache.json` 및 `data/attribution_cache.json` 생성(46티커 100%, 36조합 오차 0원), `src/live_price_server.py` `PORT`/`DISABLE_TG_POLL`/`NO_BROWSER` 환경변수 지원, `/api/attribution` 엔드포인트 및 `/원인`(`/변동`/`/급등락`/`/주범`) 명령어 구현 |
+| **T-28-3** | **대시보드 UI 3종(`build_web_index.py` -> `web/index.html`) 구현 및 컴파일** | `developer` | ✅ 완료 | ① 기간별 수익률 칩 연동 Top 5 Draggers/Leaders & 6대 팩터 분석 패널(`#attributionPanel`), ② 시계열 차트 호버 당일 Top 2 급등·급락 노출(`#hoverMoversRow`), ③ 원장 테이블 7개 기간 전환 탭(`#assetsTablePeriodTabs`) 및 동적 정렬, `web/index.html`(1,904,881 bytes) 컴파일 완료 |
+| **T-28-4** | **수학적 정합성, UI 구문/DOM 무결성 및 포트 8766 격리 서버 E2E 검증** | `qa-verifier` | ✅ 완료 | `tests/test_attribution_qa.py`(6/6 PASS) 및 `tests/verify_attribution_ui.js`(4/4 PASS, Chrome 375px/1280px 무오류) 10/10 APPROVED, 메인 워크스페이스(`c:\cowork\myasset` `v5.2-stable`) 및 8765 운영 서버 무손상 확인 |
 
 ---
 
