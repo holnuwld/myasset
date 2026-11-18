@@ -80,12 +80,8 @@ EXPANDED_SCENARIO_COUNTS = {
 POST_SELL_PERIODS = {"1D", "1W"}
 PRE_SELL_SPAN_PERIODS = {"1M", "3M", "6M", "YTD", "1Y", "peak_drawdown", "trough_gain"}
 
-EXPECTED_AST037_DELTAS = {
-    "1M": -1693720,
-    "3M": -2571520,
-    "6M": -5275200,
+FIXED_ANCHOR_AST037_DELTAS = {
     "YTD": -147000,
-    "1Y": 328720,
     "peak_drawdown": -7766360,
     "trough_gain": 509600,
 }
@@ -538,9 +534,17 @@ class TestAttributionQA(unittest.TestCase):
                 self.assertEqual(a37["valuation_end_krw"], 0)
                 self.assertEqual(a37["institution"], "나무증권")
                 self.assertEqual(a37["account_name"], "평생우대 [CMA]")
-                self.assertEqual(a37["delta_krw"], EXPECTED_AST037_DELTAS[p], f"{sc}/{p} AST-037 delta mismatch")
-                if p == "1M":
-                    self.assertEqual(a37["delta_pct"], -49.30)
+                d_start = po["d_start"]
+                px_494310 = self.ticker_cache["tickers"]["494310"]["prices"]
+                self.assertIn(d_start, px_494310, f"Missing 494310 price for {sc}/{p} d_start={d_start}")
+                exp_val_start = int(round(56.0 * float(px_494310[d_start])))
+                exp_delta_krw = 1741600 - exp_val_start
+                exp_delta_pct = round((exp_delta_krw / exp_val_start) * 100.0, 2)
+                self.assertEqual(a37["valuation_start_krw"], exp_val_start, f"{sc}/{p} AST-037 val_start mismatch")
+                self.assertEqual(a37["delta_krw"], exp_delta_krw, f"{sc}/{p} AST-037 delta mismatch")
+                self.assertEqual(a37["delta_pct"], exp_delta_pct, f"{sc}/{p} AST-037 delta_pct mismatch")
+                if p in FIXED_ANCHOR_AST037_DELTAS:
+                    self.assertEqual(a37["delta_krw"], FIXED_ANCHOR_AST037_DELTAS[p], f"{sc}/{p} fixed anchor mismatch")
                 self.assertEqual(po["period_sell_krw"], 1741600)
                 self.assertEqual(po["trade_cashflow_net_krw"], 1741600)
 
@@ -1086,7 +1090,9 @@ class TestAttributionQA(unittest.TestCase):
                 self.assertEqual(attr_1m["data"]["evaluated_asset_count"], 46)
                 self.assertEqual(len(attr_1m["data"]["by_asset"]), 46)
                 self.assertEqual(attr_1m["data"]["trade_cashflow_net_krw"], 1741600)
-                self.assertEqual(attr_1m["data"]["by_asset"]["AST-037"]["delta_krw"], -1693720)
+                d_start_1m = attr_1m["data"]["d_start"]
+                exp_1m_val_start = int(round(56.0 * float(self.ticker_cache["tickers"]["494310"]["prices"][d_start_1m])))
+                self.assertEqual(attr_1m["data"]["by_asset"]["AST-037"]["delta_krw"], 1741600 - exp_1m_val_start)
                 self.assertEqual(attr_1m["data"]["by_asset"]["AST-037"]["trade_event_note"], "11/06 56주 전량매도 반영")
                 self.assertEqual(len(attr_1m["data"]["factors"]), 6)
 

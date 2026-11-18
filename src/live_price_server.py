@@ -23,6 +23,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import concurrent.futures
+import copy
 import threading
 import time
 from datetime import datetime, date, timedelta, timezone
@@ -148,11 +149,13 @@ _cache = {
 }
 CACHE_TTL_SECONDS = 15
 
-# 시계열 캐시
+# 시계열 캐시 및 실자산 히스토리 파일 락/메모리 백업
 _history_cache = {
     "timestamp": None,
     "data": None
 }
+_history_file_lock = threading.RLock()
+_last_good_real_history = []
 
 # 기여도 분석 캐시
 _attribution_cache = {
@@ -208,13 +211,21 @@ def get_attribution_data(force_refresh=False, refresh_tickers=False, live_assets
         except Exception:
             pass
 
-    if refresh_tickers and live_market_data is None:
-        try:
-            live_market_data = fetch_all_market_data(force_refresh=True)
-        except Exception:
-            live_market_data = _cache.get("data")
-    elif live_market_data is None and _cache.get("data"):
-        live_market_data = _cache["data"]
+    if live_market_data is None:
+        cache_ts = _cache.get("timestamp")
+        cache_data = _cache.get("data")
+        cache_fresh = bool(
+            cache_data and cache_ts and (now - cache_ts).total_seconds() < 30
+        )
+        if cache_fresh:
+            live_market_data = cache_data
+        elif refresh_tickers:
+            try:
+                live_market_data = fetch_all_market_data(force_refresh=True)
+            except Exception:
+                live_market_data = cache_data
+        elif cache_data:
+            live_market_data = cache_data
 
     payload = build_attribution_payload(
         assets=live_assets,
@@ -514,21 +525,93 @@ def fetch_all_market_data(force_refresh=False):
 
 
 def load_real_history():
-    """data/asset_history.json 파일에서 일별 실제 자산 변동 스냅샷을 로드"""
-    if not os.path.exists(HISTORY_FILE):
-        return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+    """data/asset_history.json 파일에서 일별 실제 자산 변동 스냅샷을 로드 (스레드 안전 + 재시도 + 메모리 백업 보호)"""
+    global _last_good_real_history
+    with _history_file_lock:
+        if not os.path.exists(HISTORY_FILE):
+            return copy.deepcopy(_last_good_real_history) if _last_good_real_history else []
+        for attempt in range(3):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    if len(data) > 0:
+                        if len(data) >= len(_last_good_real_history):
+                            _last_good_real_history = copy.deepcopy(data)
+                        return data
+                    if _last_good_real_history:
+                        return copy.deepcopy(_last_good_real_history)
+                    return []
+                break
+            except (json.JSONDecodeError, OSError):
+                if attempt < 2:
+                    time.sleep(0.02)
+            except Exception:
+                break
+        if _last_good_real_history:
+            return copy.deepcopy(_last_good_real_history)
         return []
 
 
 def save_real_history(history_list):
-    """data/asset_history.json 파일에 일별 스냅샷 저장"""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history_list, f, ensure_ascii=False, indent=2)
+    """data/asset_history.json 파일에 일별 스냅샷 원자적 저장 (스레드 안전 + 축소 방지 가드)"""
+    global _last_good_real_history
+    with _history_file_lock:
+        target_dir = os.path.dirname(os.path.abspath(HISTORY_FILE)) or DATA_DIR
+        os.makedirs(target_dir, exist_ok=True)
+
+        merged = [copy.deepcopy(item) for item in (history_list or [])]
+        existing_dates = {
+            item.get("date")
+            for item in merged
+            if isinstance(item, dict) and item.get("date")
+        }
+
+        if isinstance(_last_good_real_history, list) and _last_good_real_history:
+            for prev_item in _last_good_real_history:
+                if isinstance(prev_item, dict):
+                    d_key = prev_item.get("date")
+                    if d_key and d_key not in existing_dates:
+                        merged.append(copy.deepcopy(prev_item))
+                        existing_dates.add(d_key)
+
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as rf:
+                    disk_data = json.load(rf)
+                if isinstance(disk_data, list):
+                    for disk_item in disk_data:
+                        if isinstance(disk_item, dict):
+                            d_key = disk_item.get("date")
+                            if d_key and d_key not in existing_dates:
+                                merged.append(copy.deepcopy(disk_item))
+                                existing_dates.add(d_key)
+            except Exception:
+                pass
+
+        merged.sort(key=lambda x: x.get("date", "") if isinstance(x, dict) else "")
+
+        tmp_path = f"{HISTORY_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(3):
+                try:
+                    os.replace(tmp_path, HISTORY_FILE)
+                    break
+                except PermissionError:
+                    if attempt >= 2:
+                        raise
+                    time.sleep(0.02)
+            _last_good_real_history = copy.deepcopy(merged)
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 
 def upsert_daily_snapshot(date_str, total_krw=None, buy_krw=None, period_returns=None,
@@ -537,69 +620,78 @@ def upsert_daily_snapshot(date_str, total_krw=None, buy_krw=None, period_returns
                           total_krw_no_pension_risk=None, buy_krw_no_pension_risk=None,
                           period_returns_risk=None, period_returns_no_pension_risk=None,
                           period_returns_no_pension=None):
-    """오늘 일자의 실자산 스냅샷을 asset_history.json에 Upsert (4대 시나리오 실자산 기록)"""
-    history = load_real_history()
+    """오늘 일자의 실자산 스냅샷을 asset_history.json에 원자적 Upsert (4대 시나리오 실자산 기록)"""
+    with _history_file_lock:
+        history = load_real_history()
 
-    if total_krw is None or buy_krw is None:
-        try:
-            with open(ASSETS_FILE, "r", encoding="utf-8") as f:
-                _assets = json.load(f)
-            total_krw = sum(a.get("valuation_krw", 0) for a in _assets)
-            buy_krw = sum(a.get("buy_krw", 0) for a in _assets)
-        except Exception:
-            total_krw = 0
-            buy_krw = 0
+        if total_krw is None or buy_krw is None:
+            try:
+                with open(ASSETS_FILE, "r", encoding="utf-8") as f:
+                    _assets = json.load(f)
+                total_krw = sum(a.get("valuation_krw", 0) for a in _assets)
+                buy_krw = sum(a.get("buy_krw", 0) for a in _assets)
+            except Exception:
+                total_krw = 0
+                buy_krw = 0
 
-    ytd_base_nav = 931860125.0  # 2026-01-02 NAV
-    ytd_return_pct = round(((total_krw - ytd_base_nav) / ytd_base_nav) * 100, 2) if ytd_base_nav > 0 else 0.0
-    cost_return_pct = round(((total_krw - buy_krw) / buy_krw) * 100, 2) if buy_krw > 0 else 0.0
+        ytd_base_nav = 931860125.0  # 2026-01-02 NAV
+        ytd_return_pct = round(((total_krw - ytd_base_nav) / ytd_base_nav) * 100, 2) if ytd_base_nav > 0 else 0.0
+        cost_return_pct = round(((total_krw - buy_krw) / buy_krw) * 100, 2) if buy_krw > 0 else 0.0
 
-    entry = {
-        "date": date_str,
-        "total_krw": round(total_krw),
-        "buy_krw": round(buy_krw),
-        "profit_krw": round(total_krw - buy_krw),
-        "return_pct": ytd_return_pct,
-        "cost_return_pct": cost_return_pct,
-        "period_returns": period_returns or {},
-        "is_real_snapshot": True,
-        "updated_at": datetime.now(KST).isoformat()
-    }
-    if total_krw_no_pension is not None:
-        entry["total_krw_no_pension"] = round(total_krw_no_pension)
-    if buy_krw_no_pension is not None:
-        entry["buy_krw_no_pension"] = round(buy_krw_no_pension)
-    if total_krw_risk is not None:
-        entry["total_krw_risk"] = round(total_krw_risk)
-    if buy_krw_risk is not None:
-        entry["buy_krw_risk"] = round(buy_krw_risk)
-    if total_krw_no_pension_risk is not None:
-        entry["total_krw_no_pension_risk"] = round(total_krw_no_pension_risk)
-    if buy_krw_no_pension_risk is not None:
-        entry["buy_krw_no_pension_risk"] = round(buy_krw_no_pension_risk)
-    if period_returns_risk:
-        entry["period_returns_risk"] = period_returns_risk
-    if period_returns_no_pension_risk:
-        entry["period_returns_no_pension_risk"] = period_returns_no_pension_risk
-    if period_returns_no_pension:
-        entry["period_returns_no_pension"] = period_returns_no_pension
+        entry = {
+            "date": date_str,
+            "total_krw": round(total_krw),
+            "buy_krw": round(buy_krw),
+            "profit_krw": round(total_krw - buy_krw),
+            "return_pct": ytd_return_pct,
+            "cost_return_pct": cost_return_pct,
+            "period_returns": period_returns or {},
+            "is_real_snapshot": True,
+            "updated_at": datetime.now(KST).isoformat()
+        }
+        if total_krw_no_pension is not None:
+            entry["total_krw_no_pension"] = round(total_krw_no_pension)
+        if buy_krw_no_pension is not None:
+            entry["buy_krw_no_pension"] = round(buy_krw_no_pension)
+        if total_krw_risk is not None:
+            entry["total_krw_risk"] = round(total_krw_risk)
+        if buy_krw_risk is not None:
+            entry["buy_krw_risk"] = round(buy_krw_risk)
+        if total_krw_no_pension_risk is not None:
+            entry["total_krw_no_pension_risk"] = round(total_krw_no_pension_risk)
+        if buy_krw_no_pension_risk is not None:
+            entry["buy_krw_no_pension_risk"] = round(buy_krw_no_pension_risk)
+        if period_returns_risk:
+            entry["period_returns_risk"] = period_returns_risk
+        if period_returns_no_pension_risk:
+            entry["period_returns_no_pension_risk"] = period_returns_no_pension_risk
+        if period_returns_no_pension:
+            entry["period_returns_no_pension"] = period_returns_no_pension
 
-    found = False
-    for i, h in enumerate(history):
-        if h.get("date") == date_str:
-            if "total_krw_no_pension" in h and "total_krw_no_pension" not in entry:
-                entry["total_krw_no_pension"] = h["total_krw_no_pension"]
-            if "buy_krw_no_pension" in h and "buy_krw_no_pension" not in entry:
-                entry["buy_krw_no_pension"] = h["buy_krw_no_pension"]
-            history[i] = entry
-            found = True
-            break
-    if not found:
-        history.append(entry)
+        found = False
+        for i, h in enumerate(history):
+            if h.get("date") == date_str:
+                if "total_krw_no_pension" in h and "total_krw_no_pension" not in entry:
+                    entry["total_krw_no_pension"] = h["total_krw_no_pension"]
+                if "buy_krw_no_pension" in h and "buy_krw_no_pension" not in entry:
+                    entry["buy_krw_no_pension"] = h["buy_krw_no_pension"]
+                for pr_k in (
+                    "period_returns",
+                    "period_returns_risk",
+                    "period_returns_no_pension_risk",
+                    "period_returns_no_pension",
+                ):
+                    if not entry.get(pr_k) and h.get(pr_k):
+                        entry[pr_k] = h[pr_k]
+                history[i] = entry
+                found = True
+                break
+        if not found:
+            history.append(entry)
 
-    history.sort(key=lambda x: x.get("date", ""))
-    save_real_history(history)
-    return entry
+        history.sort(key=lambda x: x.get("date", ""))
+        save_real_history(history)
+        return entry
 
 
 def load_calculated_history():
@@ -2405,7 +2497,15 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
 
     def handle_api_prices(self):
         try:
-            market_data = fetch_all_market_data()
+            force_refresh = False
+            if "?" in self.path:
+                from urllib.parse import parse_qs
+                query = parse_qs(self.path.split("?", 1)[1])
+                force_refresh = query.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            market_data = fetch_all_market_data(force_refresh=force_refresh)
+            if force_refresh:
+                _history_cache["timestamp"] = None
+                _history_cache["data"] = None
             history_data = generate_hybrid_history()
             market_data["period_returns"] = history_data.get("period_returns", {})
             market_data["period_returns_no_pension"] = history_data.get("period_returns_no_pension", {})
@@ -2475,6 +2575,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
             from urllib.parse import parse_qs
             query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
             refresh_flag = query.get("refresh", ["0"])[0].strip().lower() in ("1", "true", "yes")
+            refresh_tickers_flag = query.get("refresh_tickers", ["0"])[0].strip().lower() in ("1", "true", "yes")
             include_daily = query.get("include_daily", ["1"])[0].strip().lower() not in ("0", "false", "no")
             raw_scenario = query.get("scenario", ["full"])[0].strip()
             raw_period = query.get("period", [""])[0].strip()
@@ -2518,7 +2619,7 @@ class UnifiedServerHandler(http.server.BaseHTTPRequestHandler):
 
             payload = get_attribution_data(
                 force_refresh=refresh_flag,
-                refresh_tickers=refresh_flag,
+                refresh_tickers=refresh_tickers_flag,
             )
 
             if period_req:

@@ -3704,6 +3704,16 @@ html_content = r'''<!DOCTYPE html>
       return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
     }
 
+    function formatServerTimestamp(isoStr) {
+      if (isoStr) {
+        const parsed = new Date(isoStr);
+        if (!isNaN(parsed.getTime())) {
+          return formatDateTime(parsed);
+        }
+      }
+      return formatDateTime();
+    }
+
     /* ==========================================================================
        모달 외부 클릭 & ESC 닫기 & 포커스 트랩 (Requirement UI 수정 1 & 기능 2)
        ========================================================================== */
@@ -4340,15 +4350,20 @@ html_content = r'''<!DOCTYPE html>
       const rbadge = document.querySelector ? document.querySelector(".risk-only-toggle-badge") : null;
       if (rbadge) rbadge.classList.toggle("unchecked", !onlyRiskAssets);
 
-      document.getElementById("lastUpdateDateTime").innerText = formatDateTime();
+      const lastUpdEl = document.getElementById("lastUpdateDateTime");
+      if (lastUpdEl) {
+        lastUpdEl.innerText = "실시간 시세 동기화 중...";
+        if (lastUpdEl.dataset) delete lastUpdEl.dataset.liveSynced;
+      }
 
       renderAll();
       checkLiveServerHealth();
+      updateLivePrices({ silent: true, forceRefresh: false, skipSubFetches: true });
       fetchHistoryData();
       fetchAttributionData();
 
       // 자동 15분 주기 시세 갱신 타이머 연결
-      setInterval(updateLivePrices, 15 * 60 * 1000);
+      setInterval(() => updateLivePrices({ silent: true, forceRefresh: true }), 15 * 60 * 1000);
     }
 
     async function lockVault() {
@@ -4437,38 +4452,59 @@ html_content = r'''<!DOCTYPE html>
       }
     }
 
-    async function updateLivePrices() {
+    async function updateLivePrices(options = {}) {
+      const opts = (options && typeof options === "object" && !("target" in options) && typeof options.preventDefault !== "function") ? options : {};
+      const silent = Boolean(opts.silent);
+      const forceRefresh = opts.forceRefresh !== undefined ? Boolean(opts.forceRefresh) : !silent;
+      const skipSubFetches = Boolean(opts.skipSubFetches);
+
       const btn = document.getElementById("btnUpdatePrices");
       const spinner = document.getElementById("spinnerLive");
-      btn.disabled = true;
-      spinner.style.display = "inline";
+      if (!silent) {
+        if (btn) btn.disabled = true;
+        if (spinner) spinner.style.display = "inline";
+      }
 
       let serverSuccess = false;
       try {
-        const res = await fetch(`${API_BASE}/api/prices`, { mode: "cors", cache: "no-cache" });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.status === "success") {
-            applyPriceUpdate(data);
-            serverSuccess = true;
-            showToast("⚡ 실시간 시세 및 9대 기간별 수익률을 갱신했습니다!");
+        try {
+          const qs = forceRefresh ? "?refresh=1" : "";
+          const res = await fetch(`${API_BASE}/api/prices${qs}`, { mode: "cors", cache: "no-cache" });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.status === "success") {
+              applyPriceUpdate(data);
+              serverSuccess = true;
+              if (!silent) {
+                showToast("⚡ 실시간 시세 및 9대 기간별 수익률을 갱신했습니다!");
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("API 호출 실패, 브라우저 백업 갱신", e);
+        }
+
+        const lastUpdEl = document.getElementById("lastUpdateDateTime");
+        if (!serverSuccess) {
+          if (!silent) {
+            await fallbackBrowserUpdate();
+            if (lastUpdEl) lastUpdEl.innerText = formatDateTime() + " (오프라인 백업)";
+          } else if (lastUpdEl && (!lastUpdEl.dataset || lastUpdEl.dataset.liveSynced !== "1")) {
+            lastUpdEl.innerText = "내장 스냅샷 (서버 오프라인)";
           }
         }
-      } catch (e) {
-        console.warn("API 호출 실패, 브라우저 백업 갱신", e);
+
+        if (!skipSubFetches) {
+          fetchHistoryData();
+          fetchAttributionData(serverSuccess && forceRefresh);
+          fetchTransactions();
+        }
+      } finally {
+        if (!silent) {
+          if (btn) btn.disabled = false;
+          if (spinner) spinner.style.display = "none";
+        }
       }
-
-      if (!serverSuccess) {
-        await fallbackBrowserUpdate();
-      }
-
-      document.getElementById("lastUpdateDateTime").innerText = formatDateTime();
-      fetchHistoryData();
-      fetchAttributionData(serverSuccess);
-      fetchTransactions();
-
-      btn.disabled = false;
-      spinner.style.display = "none";
     }
 
     function applyPriceUpdate(data) {
@@ -4495,6 +4531,8 @@ html_content = r'''<!DOCTYPE html>
         const tickData = priceMap[a.ticker];
         if (tickData && tickData.price) {
           a.current_price = tickData.price;
+          if (tickData.change_price !== undefined) a.change_price = tickData.change_price;
+          if (tickData.change_rate !== undefined) a.change_rate = tickData.change_rate;
           const qty = Number(a.quantity || 0);
           if (qty <= 0) {
             a.valuation_origin = 0;
@@ -4523,6 +4561,12 @@ html_content = r'''<!DOCTYPE html>
 
       if (data.period_returns) {
         renderPeriodReturnChips(data.period_returns);
+      }
+
+      const lastUpdEl = document.getElementById("lastUpdateDateTime");
+      if (lastUpdEl) {
+        lastUpdEl.innerText = formatServerTimestamp(data && (data.timestamp || data.updated_at));
+        if (lastUpdEl.dataset) lastUpdEl.dataset.liveSynced = "1";
       }
 
       saveEncryptedVault();
@@ -6365,16 +6409,18 @@ html_content = r'''<!DOCTYPE html>
     const rbadge = document.querySelector ? document.querySelector(".risk-only-toggle-badge") : null;
     if (rbadge) rbadge.classList.toggle("unchecked", !onlyRiskAssets);
 
-    if (document.getElementById("lastUpdateDateTime")) document.getElementById("lastUpdateDateTime").innerText = formatDateTime();
+    const initLastUpdEl = document.getElementById("lastUpdateDateTime");
+    if (initLastUpdEl) initLastUpdEl.innerText = "실시간 시세 동기화 중...";
 
     renderAll();
     checkLiveServerHealth();
+    updateLivePrices({ silent: true, forceRefresh: false, skipSubFetches: true });
     fetchHistoryData();
     fetchAttributionData();
     fetchTransactions();
 
     // 자동 15분 주기 시세 갱신 타이머 연결
-    setInterval(updateLivePrices, 15 * 60 * 1000);
+    setInterval(() => updateLivePrices({ silent: true, forceRefresh: true }), 15 * 60 * 1000);
   </script>
 </body>
 </html>

@@ -1,7 +1,16 @@
 # 자산 관리 프로그램 작업 보드 (`task_board.md`)
 
 > **관리자**: 비서 (Main Orchestrator)  
-> **문서 버전**: v5.3.2 완료 (Phase 23.2: 스마트폰 UX 폴리싱, 메인 워크트리 병합, 바탕화면 바로가기·GitHub 반영)  
+> **문서 버전**: v5.3.3 완료 (Phase 23.3: 초기 접속 시 실시간 시세 자동 동기화, 업데이트 시각 정직화, 동시성 이력 보호 패치)  
+
+---
+
+## Phase 23.3 (v5.3.3): 실시간 시세 자동 동기화 및 업데이트 시각 정직화 버그 수정
+
+| ID | 단계 및 작업 항목 | 담당 에이전트 | 상태 | 세부 내용 및 산출물 |
+| :-: | :--- | :---: | :---: | :--- |
+| **T-28-14** | **초기 로드 실시간 시세 자동 동기화·서버 실제 수집 시각 연동·`/api/prices?refresh=1`·동시성·캐시 동기화 패치** | `developer` | ✅ 완료 | `src/live_price_server.py` `?refresh=1` + `_history_file_lock`/`_last_good_real_history`/`os.replace` 원자적 저장·30초 `_cache` 중복 차단 + `src/attribution_engine.py` `ensure_ticker_history_cache` 평일 `live_market_data` 당일 동기화 + `data/asset_history.json`(16일분)·`attribution_cache.json` 복구 + `web/index.html`(2,077,109B) 재컴파일 |
+| **T-28-15** | **초기 로드 자동 시세 갱신·타임스탬프 정직성·수동 강제 갱신·이력 무손상 E2E 및 백엔드 QA 검증** | `qa-verifier` | ✅ 완료 | `verify_attribution_ui.js`(exit 0: VM 503 `"내장 스냅샷 (서버 오프라인)"`, 미클릭 초기 자동 `/api/prices` `47`종·`liveSynced='1'`, 수동 `?refresh=1` 200 OK, `asset_history.json` 16건 보존, 5종 모바일·터치·1280px 통과) → `test_attribution_qa.py`(8/8 PASS, exit 0) → `verify_chart_svg.js`(5/5, exit 0) `APPROVED` |
 
 ---
 

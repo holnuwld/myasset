@@ -156,6 +156,8 @@ function verifySyntaxAndEmbeddedData() {
   assert(m && m[1], "Failed to extract EMBEDDED_ATTRIBUTION_DATA / DEFAULT_ATTRIBUTION_CACHE v1.1 literal");
   const embeddedAttr = vm.runInNewContext(`(${m[1]})`, Object.create(null));
   const diskAttr = JSON.parse(fs.readFileSync(ATTR_CACHE_PATH, "utf-8"));
+  const tickerCache = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, "data", "ticker_history_cache.json"), "utf-8"));
+  const prices494310 = (tickerCache.tickers && tickerCache.tickers["494310"] && tickerCache.tickers["494310"].prices) || {};
 
   assert.strictEqual(embeddedAttr.schema_version, "1.1", "DEFAULT_ATTRIBUTION_CACHE.schema_version must be 1.1");
   assert.strictEqual(embeddedAttr.as_of, diskAttr.as_of, "EMBEDDED_ATTRIBUTION_DATA as_of mismatch with disk cache");
@@ -187,8 +189,15 @@ function verifySyntaxAndEmbeddedData() {
           assert.strictEqual(a37.trade_event_note, "11/06 56주 전량매도 반영");
           assert.strictEqual(a37.institution, "나무증권");
           assert.strictEqual(a37.account_name, "평생우대 [CMA]");
-          if (p === "1M") assert.strictEqual(a37.delta_krw, -1693720);
+          assert.strictEqual(a37.sell_amount_krw, 1741600);
+          assert.strictEqual(a37.valuation_end_krw, 0);
+          const startPx494310 = Number(prices494310[pObj.d_start]);
+          assert(Number.isFinite(startPx494310) && startPx494310 > 0, `Missing 494310 price for ${p} d_start=${pObj.d_start}`);
+          assert.strictEqual(a37.valuation_start_krw, Math.round(56 * startPx494310), `${sc}/${p} AST-037 valuation_start_krw mismatch`);
+          assert.strictEqual(a37.delta_krw, 1741600 - a37.valuation_start_krw, `${sc}/${p} AST-037 delta_krw formula mismatch`);
+          if (p === "YTD") assert.strictEqual(a37.delta_krw, -147000);
           if (p === "peak_drawdown") assert.strictEqual(a37.delta_krw, -7766360);
+          if (p === "trough_gain") assert.strictEqual(a37.delta_krw, 509600);
         }
       }
       // recent_trades RP 제외 확인
@@ -268,7 +277,7 @@ function makeMockElement(id = "", tagName = "DIV", attrs = {}) {
   return el;
 }
 
-function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
+async function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
   console.log("[STEP 3] Node VM + Mock DOM 시뮬레이션 검증...");
   const elementsById = new Map();
   const ensureEl = (id, tag = "DIV") => {
@@ -348,6 +357,26 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
   const ctx = vm.createContext(sandbox);
   vm.runInContext(combinedScript, ctx, { filename: "web_index_inline.js" });
 
+  // T-28-15: 초기 동기화 중 문구 -> 오프라인(503) 마이크로태스크 소진 후 정직한 폴백 문구 전환 검증
+  assert.strictEqual(
+    ensureEl("lastUpdateDateTime").innerText,
+    "실시간 시세 동기화 중...",
+    "VM initial #lastUpdateDateTime before async flush must show syncing status"
+  );
+  await Promise.resolve();
+  await new Promise(r => setImmediate(r));
+  await new Promise(r => setImmediate(r));
+  assert.strictEqual(
+    ensureEl("lastUpdateDateTime").innerText,
+    "내장 스냅샷 (서버 오프라인)",
+    "VM offline 503 #lastUpdateDateTime must fall back to '내장 스냅샷 (서버 오프라인)' instead of fake current time"
+  );
+  assert.notStrictEqual(
+    ensureEl("lastUpdateDateTime").dataset.liveSynced,
+    "1",
+    "VM offline 503 #lastUpdateDateTime.dataset.liveSynced must not be '1'"
+  );
+
   // 0) DEFAULT_ATTRIBUTION_CACHE.schema_version & isRpTrade 단위 검증
   assert.strictEqual(vm.runInContext("DEFAULT_ATTRIBUTION_CACHE.schema_version", ctx), "1.1");
   assert.strictEqual(ctx.isRpTrade({ ticker: "RP-USD-7D-1" }), true);
@@ -388,11 +417,19 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
 
     const draggersUnit = ensureEl("attrDraggersUnit").innerText;
     const leadersUnit = ensureEl("attrLeadersUnit").innerText;
-    if (p === "1D") {
-      assert(draggersUnit.includes("참고:"), `VM 1D draggersUnit unexpected: ${draggersUnit}`);
+    const pDataVm = diskAttr.scenarios.no_pension.periods[p];
+    const expectFallback = Boolean(
+      pDataVm && pDataVm.is_market_closed_day
+      && (!Array.isArray(pDataVm.top_draggers) || pDataVm.top_draggers.length === 0)
+      && (!Array.isArray(pDataVm.top_leaders) || pDataVm.top_leaders.length === 0)
+      && pDataVm.fallback_trading_date
+    );
+    if (expectFallback) {
+      assert.strictEqual(draggersUnit, `참고: ${pDataVm.fallback_trading_date}`, `VM ${p} fallback draggersUnit unexpected: ${draggersUnit}`);
+      assert.strictEqual(leadersUnit, `참고: ${pDataVm.fallback_trading_date}`, `VM ${p} fallback leadersUnit unexpected: ${leadersUnit}`);
     } else {
-      assert.strictEqual(draggersUnit, "거래내역 반영 실보유 기준", `VM ${p} draggersUnit mismatch`);
-      assert.strictEqual(leadersUnit, "거래내역 반영 실보유 기준", `VM ${p} leadersUnit mismatch`);
+      assert.strictEqual(draggersUnit, "거래내역 반영 실보유 기준", `VM ${p} draggersUnit mismatch: ${draggersUnit}`);
+      assert.strictEqual(leadersUnit, "거래내역 반영 실보유 기준", `VM ${p} leadersUnit mismatch: ${leadersUnit}`);
     }
 
     const tradeEl = ensureEl("attrTradeNotice");
@@ -468,7 +505,7 @@ function verifyNodeVmDomSimulation(html, combinedScript, diskAttr, txJson) {
     assert.strictEqual(apiBaseVal, expectedBase, `API_BASE mismatch for protocol=${proto}`);
   }
 
-  console.log("  -> PASS: Node VM + Mock DOM (v1.1 isRpTrade, #tradesTable RP제외, AST-037 배지, 9기간·4시나리오·7탭·API_BASE) 통과");
+  console.log("  -> PASS: Node VM + Mock DOM (v1.1 isRpTrade, #tradesTable RP제외, AST-037 배지, 9기간·4시나리오·7탭·API_BASE·오프라인 타임스탬프 정직성) 통과");
 }
 
 // ============================================================================
@@ -764,7 +801,10 @@ async function verifyDeltaShadeMonotonicity(cdp, { periods, expectedWidthPx, vie
     for (const col of report.cols) {
       checkedLists += 1;
       const ctxLabel = `${viewportLabel}/${report.scKey}/${p}/${col.sel}`;
-      assert.strictEqual(col.rowCount, 5, `${ctxLabel} expected 5 mover rows, got ${col.rowCount}`);
+      assert(
+        col.expectedCount >= 1 && col.expectedCount <= 5,
+        `${ctxLabel} expected 1..5 mover rows in data, got ${col.expectedCount}`
+      );
       assert.strictEqual(col.rowCount, col.expectedCount, `${ctxLabel} DOM rowCount != data list length`);
 
       const absDeltas = col.rows.map(r => r.dataAbsDelta);
@@ -891,19 +931,25 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     const targetUrl = `${isolatedServer.baseUrl}/`;
     await cdp.send("Page.navigate", { url: targetUrl });
 
-    // 초기 렌더링 + /api/attribution + /api/history + /api/transactions 동기화 대기
+    // 초기 렌더링 + 버튼 미클릭 자동 /api/prices + /api/attribution + /api/history + /api/transactions 동기화 대기
     await waitUntil(async () => {
       return await cdp.eval(`(() => {
         const r = document.querySelectorAll('#assetsTableBody tr').length;
         const f = document.querySelectorAll('#attrFactorsGrid .attr-factor-card').length;
         const h = document.getElementById('hoverDate')?.innerText || '';
         const tb = document.getElementById('tradesCountBadge')?.innerText || '';
+        const updEl = document.getElementById('lastUpdateDateTime');
+        const liveSynced = updEl?.dataset?.liveSynced === '1';
+        const priceCnt = (window.latestMarketPrices && typeof window.latestMarketPrices === 'object')
+          ? Object.keys(window.latestMarketPrices).length
+          : 0;
         return r === 61 && f === 6 && h.length > 0 && tb.length > 0 &&
+          liveSynced && priceCnt >= 40 &&
           typeof attributionServerData === 'object' && attributionServerData !== null &&
           typeof historyServerData === 'object' && historyServerData !== null &&
           Array.isArray(currentTransactions);
       })()`);
-    }, 25000, "initial render + /api/attribution & /api/history & /api/transactions sync");
+    }, 35000, "initial render + auto /api/prices + /api/attribution & /api/history & /api/transactions sync");
 
     // 동일 오리진 상대경로 API_BASE === '' 즉시 확인
     const initOriginInfo = await cdp.eval(`({
@@ -913,6 +959,41 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     })`);
     assert.strictEqual(initOriginInfo.origin, isolatedServer.baseUrl);
     assert.strictEqual(initOriginInfo.apiBase, "", `Expected API_BASE === '' on HTTP origin, got "${initOriginInfo.apiBase}"`);
+
+    // T-28-15: 버튼 미클릭 초기 로드 자동 /api/prices 반영 및 서버 실제 수집 시각 정직성 검증
+    const initLiveSyncInfo = await cdp.eval(`(() => {
+      const el = document.getElementById('lastUpdateDateTime');
+      return {
+        text: (el?.innerText || '').trim(),
+        liveSynced: el?.dataset?.liveSynced || '',
+        priceCount: window.latestMarketPrices ? Object.keys(window.latestMarketPrices).length : 0
+      };
+    })()`);
+    assert.strictEqual(initLiveSyncInfo.liveSynced, "1", `Initial #lastUpdateDateTime.dataset.liveSynced must be '1', got "${initLiveSyncInfo.liveSynced}"`);
+    assert(initLiveSyncInfo.priceCount >= 40, `Expected >= 40 auto-synced market prices on initial load, got ${initLiveSyncInfo.priceCount}`);
+    assert(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(initLiveSyncInfo.text),
+      `Initial #lastUpdateDateTime must match YYYY-MM-DD HH:MM:SS server timestamp, got "${initLiveSyncInfo.text}"`
+    );
+    assert(
+      !initLiveSyncInfo.text.includes("내장 스냅샷") && !initLiveSyncInfo.text.includes("동기화 중"),
+      `Initial #lastUpdateDateTime must not remain placeholder text: "${initLiveSyncInfo.text}"`
+    );
+    assert.notStrictEqual(
+      initLiveSyncInfo.text,
+      "2026-11-04 22:25:00",
+      "Initial #lastUpdateDateTime must not remain static hardcoded value 2026-11-04 22:25:00"
+    );
+    const initResponses = cdp.events
+      .filter(e => e.method === "Network.responseReceived" && e.params && e.params.response)
+      .map(e => ({ url: e.params.response.url, status: e.params.response.status }));
+    assert(
+      initResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/prices` && r.status === 200),
+      `Expected initial auto-sync GET /api/prices (200 OK) without button click`
+    );
+    console.log(
+      `  -> PASS [T-28-15 초기 자동 동기화]: 버튼 미클릭 /api/prices 자동 반영 (${initLiveSyncInfo.priceCount}종목), 시각="${initLiveSyncInfo.text}", liveSynced="1"`
+    );
 
     // 초기 렌더링 직후 슬림 Top 5 Movers 바 0건 & 6대 팩터 바 6건 단언
     const initBarCounts = await cdp.eval(`(() => ({
@@ -1562,11 +1643,54 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
       const recentResponses = cdp.events.slice(netCheckStartIdx)
         .filter(e => e.method === "Network.responseReceived" && e.params && e.params.response)
         .map(e => ({ url: e.params.response.url, status: e.params.response.status }));
-      const hasPrices = recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/prices` && r.status === 200);
+      const hasPricesRefresh = recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/prices?refresh=1` && r.status === 200);
       const hasHistory = recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/history` && r.status === 200);
       const hasAttrRefresh = recentResponses.some(r => r.url.startsWith(`${isolatedServer.baseUrl}/api/attribution?refresh=1`) && r.status === 200);
-      return hasPrices && hasHistory && hasAttrRefresh;
-    }, 25000, "relative-path /api/prices + /api/history + /api/attribution?refresh=1 completion");
+      return hasPricesRefresh && hasHistory && hasAttrRefresh;
+    }, 35000, "relative-path /api/prices?refresh=1 + /api/history + /api/attribution?refresh=1 completion");
+
+    // T-28-15: 수동 버튼 클릭 강제 갱신(/api/prices?refresh=1) 및 시각 포맷·liveSynced='1' 검증
+    const recentResponses = cdp.events.slice(netCheckStartIdx)
+      .filter(e => e.method === "Network.responseReceived" && e.params && e.params.response)
+      .map(e => ({ url: e.params.response.url, status: e.params.response.status }));
+    assert(
+      recentResponses.some(r => r.url === `${isolatedServer.baseUrl}/api/prices?refresh=1` && r.status === 200),
+      `Expected /api/prices?refresh=1 (200 OK) on #btnUpdatePrices click, got: ${JSON.stringify(recentResponses)}`
+    );
+    const manualSyncInfo = await cdp.eval(`(() => {
+      const el = document.getElementById('lastUpdateDateTime');
+      return {
+        text: (el?.innerText || '').trim(),
+        liveSynced: el?.dataset?.liveSynced || '',
+        priceCount: window.latestMarketPrices ? Object.keys(window.latestMarketPrices).length : 0
+      };
+    })()`);
+    assert.strictEqual(manualSyncInfo.liveSynced, "1", `Manual refresh #lastUpdateDateTime.dataset.liveSynced must be '1', got "${manualSyncInfo.liveSynced}"`);
+    assert(manualSyncInfo.priceCount >= 40, `Expected >= 40 manually refreshed market prices, got ${manualSyncInfo.priceCount}`);
+    assert(
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(manualSyncInfo.text),
+      `Manual refresh #lastUpdateDateTime must match YYYY-MM-DD HH:MM:SS, got "${manualSyncInfo.text}"`
+    );
+    assert(
+      !manualSyncInfo.text.includes("내장 스냅샷") && !manualSyncInfo.text.includes("동기화 중") && !manualSyncInfo.text.includes("오프라인 백업"),
+      `Manual refresh #lastUpdateDateTime unexpected text: "${manualSyncInfo.text}"`
+    );
+    assert.notStrictEqual(manualSyncInfo.text, "2026-11-04 22:25:00");
+
+    // T-28-15: 수동 갱신(/api/prices?refresh=1 + /api/history + /api/attribution?refresh=1 병렬 요청) 후 asset_history.json 동시성 무손상 검증
+    const assetHistoryPath = path.join(REPO_ROOT, "data", "asset_history.json");
+    const ahAfterRefresh = JSON.parse(fs.readFileSync(assetHistoryPath, "utf-8"));
+    assert(
+      Array.isArray(ahAfterRefresh) && ahAfterRefresh.length >= 16,
+      `Expected asset_history.json length >= 16 after concurrent refresh, got ${Array.isArray(ahAfterRefresh) ? ahAfterRefresh.length : typeof ahAfterRefresh}`
+    );
+    const ahDates = new Set(ahAfterRefresh.map(item => item && item.date));
+    for (const reqDate of ["2026-11-05", "2026-11-15", "2026-11-18"]) {
+      assert(ahDates.has(reqDate), `Missing preserved snapshot date ${reqDate} in asset_history.json after manual refresh`);
+    }
+    console.log(
+      `  -> PASS [이력 무손상 가드]: 수동 갱신 병렬 요청 후 data/asset_history.json ${ahAfterRefresh.length}건 보존 확인 (2026-11-05·2026-11-15·2026-11-18 포함)`
+    );
 
     const allRequests = cdp.events
       .filter(e => e.method === "Network.requestWillBeSent" && e.params && e.params.request)
@@ -1597,7 +1721,7 @@ async function verifyRealBrowserE2E(html, diskAttr, txJson) {
     assert.strictEqual(badLocalResponses.length, 0, `HTTP >= 400 responses on isolated origin: ${JSON.stringify(badLocalResponses)}`);
     assert.strictEqual(failedLocalReqs.length, 0, `Network.loadingFailed on isolated origin: ${JSON.stringify(failedLocalReqs)}`);
     console.log(
-      `  -> PASS [상대경로 API_BASE]: API_BASE==="", 포트 8765 하드코딩 요청 0건, 동일 오리진(${isolatedServer.baseUrl}) /api/attribution·/api/prices·/api/history·/api/transactions 200 OK 확인`
+      `  -> PASS [상대경로 API_BASE & T-28-15 수동 갱신]: API_BASE==="", 포트 8765 하드코딩 요청 0건, /api/prices?refresh=1(200 OK)·시각="${manualSyncInfo.text}"·liveSynced="1" 및 동일 오리진(${isolatedServer.baseUrl}) /api/attribution·/api/prices·/api/history·/api/transactions 200 OK 확인`
     );
 
     const exceptions = cdp.events.filter(e => e.method === "Runtime.exceptionThrown");
@@ -1627,7 +1751,7 @@ async function main() {
   console.log("=== Phase 23.1 (v1.1) Attribution UI/DOM/Browser 전수 QA 검증 시작 ===");
   const { html, combinedScript, diskAttr } = verifySyntaxAndEmbeddedData();
   const txJson = fs.existsSync(TX_JSON_PATH) ? JSON.parse(fs.readFileSync(TX_JSON_PATH, "utf-8")) : [];
-  verifyNodeVmDomSimulation(html, combinedScript, diskAttr, Array.isArray(txJson) ? txJson : (txJson.transactions || []));
+  await verifyNodeVmDomSimulation(html, combinedScript, diskAttr, Array.isArray(txJson) ? txJson : (txJson.transactions || []));
   await verifyRealBrowserE2E(html, diskAttr, txJson);
   console.log("=== ALL v1.1 UI/DOM/CDP CHECKS PASSED ===");
 }

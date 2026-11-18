@@ -449,11 +449,15 @@ def ensure_ticker_history_cache(
         and existing_cov.get("unique_market_tickers") == len(needed_tickers)
     )
 
-    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str and has_v11_cov:
-        return existing
+    has_live_payload = (
+        isinstance(live_market_data, dict)
+        and bool(live_market_data.get("prices") or live_market_data.get("fx"))
+        and (today_dt.weekday() < 5)
+    )
 
-    # 기존 캐시에 모든 시계열이 있고 강제 갱신이 아니라면 네트워크 없이 스키마/커버리지 업그레이드 가능
-    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str and not has_v11_cov:
+    if not force_refresh and existing and has_all_tickers and has_fx and existing_max >= today_str:
+        if has_v11_cov and not has_live_payload:
+            return existing
         try:
             return save_ticker_history_cache(
                 {},
@@ -465,7 +469,7 @@ def ensure_ticker_history_cache(
                 transactions=transactions,
             )
         except Exception as e:
-            print(f"[AttributionEngine] ticker_history_cache upgrade error: {e}")
+            print(f"[AttributionEngine] ticker_history_cache sync/upgrade error: {e}")
             return existing
 
     # 네트워크 수집 시도 (가능한 경우)
